@@ -132,8 +132,11 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
  
 // ---------------------------------------------------------
 // Создание ссылки на оплату подписки Prodamus
-// Формат соответствует ссылкам, генерируемым BotHelp:
-// https://colibri13.payform.ru/?do=pay&subscription=ID&tg_user_id=...&signature=...
+//
+// Использует тот же набор параметров, что подтверждённо работает
+// в ссылках от BotHelp (проверено: воспроизводит их подпись для
+// исходного набора значений), меняя только tg_user_id и
+// customer_phone и пересчитывая подпись.
 // ---------------------------------------------------------
 router.post('/payment/create', express.json(), async function (req, res) {
   var telegramId = req.body.telegramId;
@@ -161,19 +164,24 @@ router.post('/payment/create', express.json(), async function (req, res) {
   // Базовый URL формы оплаты
   var formUrl = process.env.PRODAMUS_FORM_URL || 'https://colibri13.payform.ru/';
  
+  // Полный набор параметров, идентичный рабочей ссылке BotHelp,
+  // с заменой tg_user_id / customer_phone на текущего пользователя
   var params = {
     do: 'pay',
+    sys: 'bothelp',
+    callbackType: 'json',
+    _param_cusid: process.env.PRODAMUS_PARAM_CUSID || '590836',
+    _param_pid: process.env.PRODAMUS_PARAM_PID || '2',
+    _param_cid: process.env.PRODAMUS_PARAM_CID || '4',
+    urlNotification: process.env.PRODAMUS_URL_NOTIFICATION || 'https://prodamus.bothelp.io/subscription',
     subscription: subscriptionId,
+    customer_phone: phone ? String(phone).replace(/[^0-9]/g, '') : '',
+    customer_email: '',
     tg_user_id: String(telegramId),
   };
  
-  if (phone) {
-    // Prodamus ожидает номер без + и без пробелов, формат 79991234567
-    params.customer_phone = String(phone).replace(/[^0-9]/g, '');
-  }
- 
-  // Подпись по алгоритму Prodamus (официальный): HMAC-SHA256 от JSON
-  // отсортированных параметров
+  // Подпись по алгоритму Prodamus: HMAC-SHA256 от JSON отсортированных
+  // параметров с экранированием слешей (PHP json_encode style)
   if (secretKey) {
     params.signature = signData(params, secretKey);
   }
