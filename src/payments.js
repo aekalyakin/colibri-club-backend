@@ -54,7 +54,11 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
     var signature = req.headers['sign'] || req.headers['Sign'] || req.headers['x-prodamus-signature'] || req.body.signature || req.body.sign;
     var secretKey = process.env.PRODAMUS_SECRET_KEY;
  
-    if (secretKey && signature) {
+    if (secretKey) {
+      if (!signature) {
+        console.warn('Webhook rejected: no signature provided');
+        return res.status(403).json({ error: 'Signature required' });
+      }
       var valid = verifyProdamusSignature(req.body, signature, secretKey);
       if (!valid) {
         console.warn('Invalid Prodamus signature');
