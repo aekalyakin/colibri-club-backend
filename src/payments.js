@@ -163,6 +163,20 @@ router.post('/payment/create', express.json(), async function (req, res) {
     } catch (e) {
       console.error('Failed to save phone:', e.message);
     }
+  } else {
+    // Телефон не передан во фронтенде - пробуем взять из базы
+    // (например, был сохранён ранее через requestContact)
+    try {
+      var phoneResult = await pool.query(
+        'SELECT phone FROM users WHERE telegram_id = $1',
+        [telegramId]
+      );
+      if (phoneResult.rows.length > 0 && phoneResult.rows[0].phone) {
+        phone = phoneResult.rows[0].phone;
+      }
+    } catch (e) {
+      console.error('Failed to fetch phone from DB:', e.message);
+    }
   }
  
   // Базовый URL формы оплаты
