@@ -1,7 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false });
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: false });
 
 // Уведомление об успешной оплате
 async function notifyPaymentSuccess(telegramId, expiresAt) {
