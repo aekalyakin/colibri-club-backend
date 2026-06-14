@@ -13,7 +13,8 @@ app.use(cors({
     'https://colibriclub13.netlify.app',
     /\.netlify\.app$/
   ],
-  methods: ['GET', 'POST', 'PATCH'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'X-Telegram-Id'],
 }));
  
 app.use(express.json());
@@ -21,9 +22,11 @@ app.use(express.json());
 // Роуты
 const apiRoutes = require('./api');
 const paymentRoutes = require('./payments');
+const adminRoutes = require('./admin');
  
 app.use('/api', apiRoutes);
 app.use('/api', paymentRoutes);
+app.use('/api', adminRoutes);
  
 // Health check
 app.get('/health', (req, res) => {
