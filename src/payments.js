@@ -194,6 +194,9 @@ router.post('/payment/create', express.json(), async function (req, res) {
  
   var paymentUrl = formUrl + (formUrl.indexOf('?') === -1 ? '?' : '&') + query;
  
+  console.log('Payment link generated for telegram_id=' + telegramId + ', phone=' + (phone || 'none') + ':');
+  console.log(paymentUrl);
+ 
   res.json({ url: paymentUrl });
 });
  
