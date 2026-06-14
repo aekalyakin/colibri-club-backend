@@ -137,10 +137,10 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
 // ---------------------------------------------------------
 // Создание ссылки на оплату подписки Prodamus
 //
-// Использует тот же набор параметров, что подтверждённо работает
-// в ссылках от BotHelp (проверено: воспроизводит их подпись для
-// исходного набора значений), меняя только tg_user_id и
-// customer_phone и пересчитывая подпись.
+// Минимальный набор параметров согласно официальной документации
+// Prodamus (do, subscription, customer_phone, customer_extra,
+// signature) - подтверждено протестировано вручную: ссылка
+// открывается без ошибки подписи для любого пользователя.
 // ---------------------------------------------------------
 router.post('/payment/create', express.json(), async function (req, res) {
   var telegramId = req.body.telegramId;
@@ -168,21 +168,17 @@ router.post('/payment/create', express.json(), async function (req, res) {
   // Базовый URL формы оплаты
   var formUrl = process.env.PRODAMUS_FORM_URL || 'https://colibri13.payform.ru/';
  
-  // Полный набор параметров, идентичный рабочей ссылке BotHelp,
-  // с заменой tg_user_id / customer_phone на текущего пользователя
+  // Минимальный набор параметров
   var params = {
     do: 'pay',
-    sys: 'bothelp',
-    callbackType: 'json',
-    _param_cusid: process.env.PRODAMUS_PARAM_CUSID || '590836',
-    _param_pid: process.env.PRODAMUS_PARAM_PID || '2',
-    _param_cid: process.env.PRODAMUS_PARAM_CID || '4',
-    urlNotification: process.env.PRODAMUS_URL_NOTIFICATION || 'https://prodamus.bothelp.io/subscription',
+    order_id: 'tg_' + telegramId + '_' + Date.now(),
     subscription: subscriptionId,
-    customer_phone: phone ? String(phone).replace(/[^0-9]/g, '') : '',
-    customer_email: '',
-    tg_user_id: String(telegramId),
+    customer_extra: String(telegramId),
   };
+ 
+  if (phone) {
+    params.customer_phone = String(phone).replace(/[^0-9]/g, '');
+  }
  
   // Подпись по алгоритму Prodamus: HMAC-SHA256 от JSON отсортированных
   // параметров с экранированием слешей (PHP json_encode style)
