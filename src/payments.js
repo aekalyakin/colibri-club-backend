@@ -27,16 +27,21 @@ function sortObject(obj) {
 }
  
 // Генерация подписи для исходящего запроса (создание ссылки на оплату)
+// Prodamus использует PHP json_encode (без JSON_UNESCAPED_SLASHES), поэтому
+// экранируем слеши "/" -> "\/" как это делает PHP по умолчанию
 function signData(data, secretKey) {
   var sorted = sortObject(data);
-  var json = JSON.stringify(sorted);
+  var json = JSON.stringify(sorted).replace(/\//g, '\\/');
   return crypto.createHmac('sha256', secretKey).update(json).digest('hex');
 }
  
 // Проверка подписи входящего webhook
 function verifyProdamusSignature(body, signature, secretKey) {
-  var sorted = sortObject(body);
-  var json = JSON.stringify(sorted);
+  var bodyCopy = Object.assign({}, body);
+  delete bodyCopy.sign;
+  delete bodyCopy.signature;
+  var sorted = sortObject(bodyCopy);
+  var json = JSON.stringify(sorted).replace(/\//g, '\\/');
   var hash = crypto.createHmac('sha256', secretKey).update(json).digest('hex');
   return hash === signature;
 }
@@ -46,7 +51,7 @@ function verifyProdamusSignature(body, signature, secretKey) {
 // ---------------------------------------------------------
 router.post('/prodamus/webhook', express.json(), async function (req, res) {
   try {
-    var signature = req.headers['sign'] || req.headers['x-prodamus-signature'];
+    var signature = req.headers['sign'] || req.headers['Sign'] || req.headers['x-prodamus-signature'] || req.body.signature || req.body.sign;
     var secretKey = process.env.PRODAMUS_SECRET_KEY;
  
     if (secretKey && signature) {
@@ -167,9 +172,10 @@ router.post('/payment/create', express.json(), async function (req, res) {
     params.customer_phone = String(phone).replace(/[^0-9]/g, '');
   }
  
-  // Подпись по алгоритму Prodamus: HMAC-SHA256 от отсортированных query-параметров
+  // Подпись по алгоритму Prodamus (официальный): HMAC-SHA256 от JSON
+  // отсортированных параметров
   if (secretKey) {
-    params.signature = signQueryParams(params, secretKey);
+    params.signature = signData(params, secretKey);
   }
  
   var query = Object.keys(params)
@@ -183,14 +189,5 @@ router.post('/payment/create', express.json(), async function (req, res) {
   res.json({ url: paymentUrl });
 });
  
-// Подпись для query-параметров: сортируем по ключу, склеиваем как key=value, HMAC-SHA256
-function signQueryParams(params, secretKey) {
-  var sortedKeys = Object.keys(params).sort();
-  var pairs = sortedKeys.map(function (key) {
-    return key + '=' + params[key];
-  });
-  var str = pairs.join('&');
-  return crypto.createHmac('sha256', secretKey).update(str).digest('hex');
-}
- 
 module.exports = router;
+ 
