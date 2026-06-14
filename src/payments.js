@@ -5,46 +5,85 @@ const dayjs = require('dayjs');
 const pool = require('./db');
 const { notifyPaymentSuccess } = require('./bot');
 require('dotenv').config();
-
-// Проверка подписи Prodamus
-function verifyProdamusSignature(body, signature) {
-  const secret = process.env.PRODAMUS_SECRET_KEY;
-  const hash = crypto
-    .createHmac('sha256', secret)
-    .update(JSON.stringify(body))
-    .digest('hex');
+ 
+// ---------------------------------------------------------
+// Подпись Prodamus (алгоритм HMAC-SHA256 по их документации)
+// https://help.prodamus.ru/payform/integracii/api/podpis-zaprosa
+// ---------------------------------------------------------
+ 
+// Рекурсивная сортировка ключей объекта (нужна для подписи)
+function sortObject(obj) {
+  if (Array.isArray(obj)) {
+    return obj.map(sortObject);
+  }
+  if (obj !== null && typeof obj === 'object') {
+    var sorted = {};
+    Object.keys(obj).sort().forEach(function (key) {
+      sorted[key] = sortObject(obj[key]);
+    });
+    return sorted;
+  }
+  return obj;
+}
+ 
+// Генерация подписи для исходящего запроса (создание ссылки на оплату)
+function signData(data, secretKey) {
+  var sorted = sortObject(data);
+  var json = JSON.stringify(sorted);
+  return crypto.createHmac('sha256', secretKey).update(json).digest('hex');
+}
+ 
+// Проверка подписи входящего webhook
+function verifyProdamusSignature(body, signature, secretKey) {
+  var sorted = sortObject(body);
+  var json = JSON.stringify(sorted);
+  var hash = crypto.createHmac('sha256', secretKey).update(json).digest('hex');
   return hash === signature;
 }
-
-// Webhook от Prodamus — вызывается после успешной оплаты
-router.post('/prodamus/webhook', express.json(), async (req, res) => {
+ 
+// ---------------------------------------------------------
+// Webhook от Prodamus — вызывается после оплаты
+// ---------------------------------------------------------
+router.post('/prodamus/webhook', express.json(), async function (req, res) {
   try {
-    const signature = req.headers['x-prodamus-signature'];
-
-    // Проверяем подпись (безопасность)
-    if (!verifyProdamusSignature(req.body, signature)) {
-      console.warn('⚠️ Неверная подпись Prodamus');
-      return res.status(403).json({ error: 'Invalid signature' });
+    var signature = req.headers['sign'] || req.headers['x-prodamus-signature'];
+    var secretKey = process.env.PRODAMUS_SECRET_KEY;
+ 
+    if (secretKey && signature) {
+      var valid = verifyProdamusSignature(req.body, signature, secretKey);
+      if (!valid) {
+        console.warn('Invalid Prodamus signature');
+        return res.status(403).json({ error: 'Invalid signature' });
+      }
+    } else {
+      console.warn('PRODAMUS_SECRET_KEY not set - skipping signature check (DEV ONLY)');
     }
-
-    const { order_id, status, customer_extra, amount } = req.body;
-
-    // customer_extra — это telegram_id, который мы передаём при создании платежа
-    const telegramId = customer_extra;
-
-    if (status !== 'paid') {
-      return res.json({ ok: true, message: 'Статус не paid, пропускаем' });
+ 
+    var body = req.body;
+    var orderId = body.order_id || body.order_num;
+    var status = body.payment_status || body.status;
+    var telegramId = body.customer_extra || body.order_extra;
+    var amount = body.sum || body.amount;
+ 
+    if (!telegramId) {
+      console.warn('No telegramId (customer_extra) in webhook body');
+      return res.json({ ok: true, message: 'No customer_extra, skipping' });
     }
-
+ 
+    // Принимаем оплату только в статусе success / paid
+    if (status !== 'success' && status !== 'paid') {
+      return res.json({ ok: true, message: 'Status is not success, skipping' });
+    }
+ 
     // Ищем или создаём пользователя
-    let userResult = await pool.query(
+    var userResult = await pool.query(
       'SELECT id FROM users WHERE telegram_id = $1',
       [telegramId]
     );
-
-    let userId;
+ 
+    var userId;
     if (userResult.rows.length === 0) {
-      const newUser = await pool.query(
+      var newUser = await pool.query(
         'INSERT INTO users (telegram_id) VALUES ($1) RETURNING id',
         [telegramId]
       );
@@ -52,53 +91,78 @@ router.post('/prodamus/webhook', express.json(), async (req, res) => {
     } else {
       userId = userResult.rows[0].id;
     }
-
-    // Вычисляем срок членства
-    const expiresAt = dayjs().add(process.env.MEMBERSHIP_DAYS, 'day').toDate();
-
+ 
+    // Срок членства
+    var expiresAt = dayjs().add(process.env.MEMBERSHIP_DAYS || 30, 'day').toDate();
+ 
     // Создаём членство
-    const membership = await pool.query(
-      `INSERT INTO memberships (user_id, status, expires_at)
-       VALUES ($1, 'active', $2) RETURNING id`,
+    var membership = await pool.query(
+      "INSERT INTO memberships (user_id, status, expires_at) VALUES ($1, 'active', $2) RETURNING id",
       [userId, expiresAt]
     );
-
-    // Записываем платёж
+ 
+    // Записываем платёж (ON CONFLICT - чтобы вебхук можно было безопасно повторить)
     await pool.query(
-      `INSERT INTO payments (user_id, prodamus_order_id, amount, status, membership_id, paid_at)
-       VALUES ($1, $2, $3, 'paid', $4, NOW())`,
-      [userId, order_id, amount, membership.rows[0].id]
+      "INSERT INTO payments (user_id, prodamus_order_id, amount, status, membership_id, paid_at) " +
+      "VALUES ($1, $2, $3, 'paid', $4, NOW()) " +
+      "ON CONFLICT (prodamus_order_id) DO UPDATE SET status = 'paid', paid_at = NOW()",
+      [userId, orderId, amount, membership.rows[0].id]
     );
-
+ 
     // Уведомляем пользователя в Telegram
-    await notifyPaymentSuccess(telegramId, expiresAt);
-
-    console.log(`✅ Членство активировано: telegram_id=${telegramId}, до ${expiresAt}`);
+    try {
+      await notifyPaymentSuccess(telegramId, expiresAt);
+    } catch (e) {
+      console.error('Failed to send Telegram notification:', e.message);
+    }
+ 
+    console.log('Membership activated: telegram_id=' + telegramId + ', until ' + expiresAt);
     res.json({ ok: true });
-
+ 
   } catch (err) {
-    console.error('❌ Ошибка webhook Prodamus:', err);
+    console.error('Prodamus webhook error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-// Генерация ссылки на оплату Prodamus
-router.post('/payment/create', express.json(), async (req, res) => {
-  const { telegramId } = req.body;
-
+ 
+// ---------------------------------------------------------
+// Создание ссылки на оплату (с подписью)
+// ---------------------------------------------------------
+router.post('/payment/create', express.json(), async function (req, res) {
+  var telegramId = req.body.telegramId;
+ 
   if (!telegramId) {
-    return res.status(400).json({ error: 'telegramId обязателен' });
+    return res.status(400).json({ error: 'telegramId is required' });
   }
-
-  // Формируем ссылку на оплату Prodamus
-  // Замените YOUR_PRODAMUS_LINK на вашу ссылку из личного кабинета Prodamus
-  const paymentUrl = `https://YOUR_PRODAMUS_LINK?` +
-    `sum=${process.env.MEMBERSHIP_PRICE}` +
-    `&order_id=${Date.now()}` +
-    `&customer_extra=${telegramId}` +
-    `&do=pay`;
-
-  res.json({ url: paymentUrl });
+ 
+  var secretKey = process.env.PRODAMUS_SECRET_KEY;
+  var orderId = 'tg_' + telegramId + '_' + Date.now();
+ 
+  // Базовый URL формы оплаты (страница продукта в Prodamus)
+  // Замените на ваш реальный URL формы из личного кабинета Prodamus
+  var formUrl = process.env.PRODAMUS_FORM_URL || 'https://colibri13.payform.ru/';
+ 
+  var params = {
+    do: 'pay',
+    order_id: orderId,
+    customer_extra: String(telegramId),
+    sum: process.env.MEMBERSHIP_PRICE || '390',
+  };
+ 
+  // Если есть секретный ключ - добавляем подпись
+  if (secretKey) {
+    params.sign = signData(params, secretKey);
+  }
+ 
+  var query = Object.keys(params)
+    .map(function (key) {
+      return encodeURIComponent(key) + '=' + encodeURIComponent(params[key]);
+    })
+    .join('&');
+ 
+  var paymentUrl = formUrl + (formUrl.indexOf('?') === -1 ? '?' : '&') + query;
+ 
+  res.json({ url: paymentUrl, orderId: orderId });
 });
-
+ 
 module.exports = router;
