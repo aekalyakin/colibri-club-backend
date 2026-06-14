@@ -60,14 +60,14 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
     }
  
     var body = req.body;
-    var orderId = body.order_id || body.order_num;
+    var orderId = body.order_id || body.order_num || (body.subscription && body.subscription_id) || ('sub_' + Date.now());
     var status = body.payment_status || body.status;
-    var telegramId = body.customer_extra || body.order_extra;
-    var amount = body.sum || body.amount;
+    var telegramId = body.tg_user_id || body.customer_extra || body.order_extra;
+    var amount = body.sum || body.amount || process.env.MEMBERSHIP_PRICE || 390;
  
     if (!telegramId) {
-      console.warn('No telegramId (customer_extra) in webhook body');
-      return res.json({ ok: true, message: 'No customer_extra, skipping' });
+      console.warn('No telegramId (tg_user_id/customer_extra) in webhook body');
+      return res.json({ ok: true, message: 'No telegram id, skipping' });
     }
  
     // Принимаем оплату только в статусе success / paid
@@ -126,32 +126,50 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
 });
  
 // ---------------------------------------------------------
-// Создание ссылки на оплату (с подписью)
+// Создание ссылки на оплату подписки Prodamus
+// Формат соответствует ссылкам, генерируемым BotHelp:
+// https://colibri13.payform.ru/?do=pay&subscription=ID&tg_user_id=...&signature=...
 // ---------------------------------------------------------
 router.post('/payment/create', express.json(), async function (req, res) {
   var telegramId = req.body.telegramId;
+  var phone = req.body.phone;
  
   if (!telegramId) {
     return res.status(400).json({ error: 'telegramId is required' });
   }
  
   var secretKey = process.env.PRODAMUS_SECRET_KEY;
-  var orderId = 'tg_' + telegramId + '_' + Date.now();
+  var subscriptionId = process.env.PRODAMUS_SUBSCRIPTION_ID || '2724580';
  
-  // Базовый URL формы оплаты (страница продукта в Prodamus)
-  // Замените на ваш реальный URL формы из личного кабинета Prodamus
+  // Если передан телефон - сохраняем его в базе для пользователя
+  if (phone) {
+    try {
+      await pool.query(
+        'UPDATE users SET phone = $1 WHERE telegram_id = $2',
+        [phone, telegramId]
+      );
+    } catch (e) {
+      console.error('Failed to save phone:', e.message);
+    }
+  }
+ 
+  // Базовый URL формы оплаты
   var formUrl = process.env.PRODAMUS_FORM_URL || 'https://colibri13.payform.ru/';
  
   var params = {
     do: 'pay',
-    order_id: orderId,
-    customer_extra: String(telegramId),
-    sum: process.env.MEMBERSHIP_PRICE || '390',
+    subscription: subscriptionId,
+    tg_user_id: String(telegramId),
   };
  
-  // Если есть секретный ключ - добавляем подпись
+  if (phone) {
+    // Prodamus ожидает номер без + и без пробелов, формат 79991234567
+    params.customer_phone = String(phone).replace(/[^0-9]/g, '');
+  }
+ 
+  // Подпись по алгоритму Prodamus: HMAC-SHA256 от отсортированных query-параметров
   if (secretKey) {
-    params.sign = signData(params, secretKey);
+    params.signature = signQueryParams(params, secretKey);
   }
  
   var query = Object.keys(params)
@@ -162,7 +180,17 @@ router.post('/payment/create', express.json(), async function (req, res) {
  
   var paymentUrl = formUrl + (formUrl.indexOf('?') === -1 ? '?' : '&') + query;
  
-  res.json({ url: paymentUrl, orderId: orderId });
+  res.json({ url: paymentUrl });
 });
+ 
+// Подпись для query-параметров: сортируем по ключу, склеиваем как key=value, HMAC-SHA256
+function signQueryParams(params, secretKey) {
+  var sortedKeys = Object.keys(params).sort();
+  var pairs = sortedKeys.map(function (key) {
+    return key + '=' + params[key];
+  });
+  var str = pairs.join('&');
+  return crypto.createHmac('sha256', secretKey).update(str).digest('hex');
+}
  
 module.exports = router;
