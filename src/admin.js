@@ -113,7 +113,7 @@ function parseSubscribersCsv(csvText) {
     rows.push(row);
   }
  
-  return { headers: headers, rows: rows };
+  return { headers: headers, rows: rows, delimiter: delimiter };
 }
  
 // Получить роль пользователя по telegram_id (null если не админ)
@@ -604,6 +604,24 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
   var COL_SUBSCRIPTION_DATE = headers.find(function (h) { return /дата\s*подписки/i.test(h); });
   var COL_ACTIVITY = headers.find(function (h) { return /активность/i.test(h); });
   var COL_FULL_NAME = headers.find(function (h) { return /(имя|фио|full.?name)/i.test(h); });
+ 
+  // --- Режим диагностики: вернуть разобранную структуру без записи в БД ---
+  if (req.body.debug) {
+    return res.json({
+      delimiter: parsed.delimiter === '\t' ? 'TAB' : parsed.delimiter,
+      headers: headers,
+      detectedColumns: {
+        phone: COL_PHONE,
+        tgId: COL_TG_ID,
+        nextPayment: COL_NEXT_PAYMENT,
+        subscriptionDate: COL_SUBSCRIPTION_DATE,
+        activity: COL_ACTIVITY,
+        fullName: COL_FULL_NAME,
+      },
+      totalRows: rows.length,
+      sampleRows: rows.slice(0, 5),
+    });
+  }
  
   if (!COL_PHONE && !COL_TG_ID) {
     return res.status(400).json({
