@@ -12,7 +12,7 @@ const path = require('path');
 
 // --- НАСТРОЙКИ ---
 const API_URL = 'https://colibri-club-backend-production.up.railway.app/admin/import-subscribers-raw';
-const OWNER_TELEGRAM_ID = 'ВАШ_TELEGRAM_ID'; // <-- замените на свой telegram_id владельца
+const OWNER_TELEGRAM_ID = '413326874'; // <-- замените на свой telegram_id владельца
 const CSV_PATH = path.join(__dirname, 'subscribers.csv');
 
 async function main() {
@@ -22,7 +22,7 @@ async function main() {
     process.exit(1);
   }
 
-  if (OWNER_TELEGRAM_ID === 'ВАШ_TELEGRAM_ID') {
+  if (OWNER_TELEGRAM_ID === '413326874') {
     console.error('Укажите свой OWNER_TELEGRAM_ID в начале файла import.js');
     process.exit(1);
   }
