@@ -64,8 +64,8 @@ function parseCsvLine(line, delimiter) {
 
 // ---------------------------------------------------------
 // Парсер дат из CSV Prodamus. Поддерживает два формата:
-//  - "ДД.ММ.ГГГГ ЧЧ:мм"        (например, "14.07.2026 18:13")
-//  - "ГГГГ-ММ-ДД ЧЧ:мм:сс"     (например, "2026-06-15 10:08:57")
+// - "ДД.ММ.ГГГГ ЧЧ:мм" (например, "14.07.2026 18:13")
+// - "ГГГГ-ММ-ДД ЧЧ:мм:сс" (например, "2026-06-15 10:08:57")
 // ---------------------------------------------------------
 function parseRuDateTime(str) {
   if (!str) return null;
@@ -809,6 +809,246 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
     created: created,
     skipped: skipped,
     errors: errors,
+  });
+});
+
+// ---------------------------------------------------------
+// Парсер CSV из Bitrix-таблицы истории платежей.
+// Формат заголовков: Имя,ФИО,Ник тг,Телефон,Подписка
+// Разделитель — запятая (','), даты в "Подписка" — "ГГГГ-ММ-ДД".
+// Каждая строка = один платёж (390₽), "Подписка" = дата ОКОНЧАНИЯ
+// подписки по этому платежу (т.е. expires_at = "Подписка",
+// paid_at = "Подписка" - 30 дней).
+// ---------------------------------------------------------
+
+// Парсер даты "ГГГГ-ММ-ДД" в Date (без времени)
+function parseSimpleDate(str) {
+  if (!str) return null;
+  var trimmed = String(str).trim();
+  var m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!m) return null;
+  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+}
+
+// ---------------------------------------------------------
+// ВЛАДЕЛЕЦ: импорт истории платежей из Bitrix-таблицы (CSV)
+// Ожидает: { csv: "Имя,ФИО,Ник тг,Телефон,Подписка\n...", debug: true|false }
+//
+// Сопоставление со users:
+//   1) по нормализованному телефону (users.phone)
+//   2) если телефона нет — по точному совпадению ФИО (или Имя,
+//      если ФИО пусто) с users.full_name
+//   3) если не найдено — строка попадает в unmatched, не импортируется
+//
+// Для каждой совпавшей строки создаётся запись в payments
+// (amount=390, status='paid', paid_at = "Подписка" - 30 дней,
+// prodamus_order_id = 'bx_import_<номер строки>').
+//
+// После обработки всех строк для каждого затронутого пользователя:
+//   - users.created_at = MIN(текущий created_at, самый ранний paid_at)
+//   - последняя по expires_at запись memberships:
+//       started_at = MIN(текущий started_at, самый ранний paid_at)
+// ---------------------------------------------------------
+router.post('/admin/import-payments-history', requireRole('owner'), async function (req, res) {
+  var csv = req.body.csv;
+
+  if (!csv || typeof csv !== 'string' || !csv.trim()) {
+    return res.status(400).json({ error: 'Поле "csv" обязательно и должно быть непустой строкой' });
+  }
+
+  // Эта таблица всегда с запятой как разделителем (экспорт Google Sheets)
+  var text = csv.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  var lines = text.split('\n').filter(function (l) { return l.trim().length > 0; });
+  if (lines.length === 0) {
+    return res.status(400).json({ error: 'CSV не содержит строк данных' });
+  }
+
+  var headers = parseCsvLine(lines[0], ',').map(function (h) { return h.trim(); });
+  var rows = [];
+  for (var li = 1; li < lines.length; li++) {
+    var cells = parseCsvLine(lines[li], ',');
+    var row = {};
+    headers.forEach(function (h, idx) {
+      row[h] = cells[idx] !== undefined ? cells[idx] : '';
+    });
+    rows.push(row);
+  }
+
+  if (rows.length === 0) {
+    return res.status(400).json({ error: 'CSV не содержит строк данных' });
+  }
+
+  var COL_NAME = headers.find(function (h) { return /^имя/i.test(h); });
+  var COL_FULLNAME = headers.find(function (h) { return /фио/i.test(h); });
+  var COL_TG_NICK = headers.find(function (h) { return /ник\s*тг/i.test(h); });
+  var COL_PHONE = headers.find(function (h) { return /телефон/i.test(h); });
+  var COL_EXPIRES = headers.find(function (h) { return /подписка/i.test(h); });
+
+  if (!COL_PHONE || !COL_EXPIRES) {
+    return res.status(400).json({
+      error: 'Не найдены обязательные колонки "Телефон" / "Подписка" в заголовках CSV',
+      headers: headers,
+    });
+  }
+
+  // --- Режим диагностики: вернуть разобранную структуру без записи в БД ---
+  if (req.body.debug) {
+    return res.json({
+      headers: headers,
+      detectedColumns: {
+        name: COL_NAME,
+        fullName: COL_FULLNAME,
+        tgNick: COL_TG_NICK,
+        phone: COL_PHONE,
+        expires: COL_EXPIRES,
+      },
+      totalRows: rows.length,
+      sampleRows: rows.slice(0, 5),
+    });
+  }
+
+  var imported = 0;
+  var skipped = 0;
+  var unmatched = [];
+  var errors = [];
+
+  // Кеш: затронутые пользователи -> самая ранняя дата платежа (для пост-обработки)
+  var affectedUsers = {}; // userId -> earliest Date
+
+  var client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+
+      try {
+        await client.query('SAVEPOINT row_' + i);
+
+        var rawPhone = row[COL_PHONE];
+        var rawFullName = COL_FULLNAME ? row[COL_FULLNAME] : null;
+        var rawName = COL_NAME ? row[COL_NAME] : null;
+        var rawExpires = row[COL_EXPIRES];
+
+        var phone = normalizePhone(rawPhone);
+        var expiresAt = parseSimpleDate(rawExpires);
+
+        if (!expiresAt) {
+          skipped++;
+          await client.query('RELEASE SAVEPOINT row_' + i);
+          continue;
+        }
+
+        // paid_at = expires_at - 30 дней
+        var paidAt = new Date(expiresAt.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+        // --- Поиск пользователя ---
+        var userRow = null;
+
+        if (phone) {
+          var byPhone = await client.query(
+            'SELECT id, created_at FROM users WHERE phone = $1 LIMIT 1',
+            [phone]
+          );
+          if (byPhone.rows.length > 0) userRow = byPhone.rows[0];
+        }
+
+        if (!userRow) {
+          var nameCandidate = (rawFullName && rawFullName.trim()) || (rawName && rawName.trim());
+          if (nameCandidate) {
+            var byName = await client.query(
+              'SELECT id, created_at FROM users WHERE full_name = $1 LIMIT 1',
+              [nameCandidate]
+            );
+            if (byName.rows.length > 0) userRow = byName.rows[0];
+          }
+        }
+
+        if (!userRow) {
+          unmatched.push({
+            row: i + 2, // +2: заголовок + 1-индексация
+            name: rawName || '',
+            fullName: rawFullName || '',
+            tgNick: COL_TG_NICK ? row[COL_TG_NICK] : '',
+            phone: rawPhone || '',
+            expires: rawExpires || '',
+          });
+          await client.query('RELEASE SAVEPOINT row_' + i);
+          continue;
+        }
+
+        var userId = userRow.id;
+
+        // --- Создаём запись платежа ---
+        var orderId = 'bx_import_' + (i + 2);
+
+        await client.query(`
+          INSERT INTO payments (user_id, prodamus_order_id, amount, status, paid_at)
+          VALUES ($1, $2, 390, 'paid', $3)
+          ON CONFLICT (prodamus_order_id) DO UPDATE SET paid_at = $3, amount = 390, status = 'paid'
+        `, [userId, orderId, paidAt]);
+
+        imported++;
+
+        // Отслеживаем самую раннюю дату платежа на пользователя
+        if (!affectedUsers[userId] || paidAt < affectedUsers[userId]) {
+          affectedUsers[userId] = paidAt;
+        }
+
+        await client.query('RELEASE SAVEPOINT row_' + i);
+      } catch (rowErr) {
+        await client.query('ROLLBACK TO SAVEPOINT row_' + i);
+        skipped++;
+        if (errors.length < 20) {
+          errors.push({ row: i + 2, error: rowErr.message });
+        }
+      }
+    }
+
+    // --- Пост-обработка: обновляем created_at и started_at по самой ранней дате платежа ---
+    var userIds = Object.keys(affectedUsers);
+    for (var u = 0; u < userIds.length; u++) {
+      var uid = userIds[u];
+      var earliest = affectedUsers[uid];
+
+      // users.created_at = MIN(текущий, earliest)
+      await client.query(
+        'UPDATE users SET created_at = LEAST(created_at, $1) WHERE id = $2',
+        [earliest, uid]
+      );
+
+      // Последняя по expires_at membership-запись пользователя:
+      // started_at = MIN(текущий started_at, earliest)
+      var membership = await client.query(
+        'SELECT id, started_at FROM memberships WHERE user_id = $1 ORDER BY expires_at DESC NULLS LAST LIMIT 1',
+        [uid]
+      );
+      if (membership.rows.length > 0) {
+        await client.query(
+          'UPDATE memberships SET started_at = LEAST(started_at, $1) WHERE id = $2',
+          [earliest, membership.rows[0].id]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /admin/import-payments-history error:', err);
+    return res.status(500).json({ error: 'Ошибка сервера при импорте', details: err.message });
+  } finally {
+    client.release();
+  }
+
+  res.json({
+    message: 'Импорт истории платежей завершён',
+    total: rows.length,
+    imported: imported,
+    skipped: skipped,
+    usersUpdated: Object.keys(affectedUsers).length,
+    unmatchedCount: unmatched.length,
+    unmatched: unmatched,
   });
 });
 
