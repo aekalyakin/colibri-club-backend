@@ -137,27 +137,61 @@ router.post('/prodamus/webhook', express.json(), async function (req, res) {
 // ---------------------------------------------------------
 // Создание ссылки на оплату подписки Prodamus
 //
-// Минимальный набор параметров (do=pay + customer_extra) -
-// подтверждено протестировано вручную: ссылка открывается без
-// ошибки подписи, выдаёт новый номер заказа каждый раз, тип
-// "Подписка с автосписанием каждые 30 дней", сумма 390р.
-// Покупатель сам вводит свой телефон/email на странице оплаты.
+// Подтверждено протестировано вручную: формат с параметрами
+// do, order_id, sys=bothelp, subscription, customer_extra и
+// подписью (HMAC-SHA256 от JSON отсортированных параметров с
+// экранированием слешей) открывается без ошибки подписи, выдаёт
+// новый номер заказа, тип "Подписка с автосписанием каждые 30
+// дней", сумму 390р, и НЕ подставляет чужие данные получателя -
+// покупатель сам вводит свой телефон/email на странице оплаты.
 // customer_extra передаёт telegram_id для сопоставления в webhook.
 // ---------------------------------------------------------
 router.post('/payment/create', express.json(), async function (req, res) {
   var telegramId = req.body.telegramId;
+  var phone = req.body.phone;
  
   if (!telegramId) {
     return res.status(400).json({ error: 'telegramId is required' });
   }
  
-  // Базовый URL формы подписки (содержит конкретный тариф 390р/30дней)
-  var formUrl = process.env.PRODAMUS_FORM_URL || 'https://colibri13.payform.ru/p/p6xrh0j5180ced/';
+  var secretKey = process.env.PRODAMUS_SECRET_KEY;
+  var subscriptionId = process.env.PRODAMUS_SUBSCRIPTION_ID || '2724580';
+ 
+  // Если телефон не передан явно - пробуем взять из базы
+  // (сохранён ранее через tg.requestContact)
+  if (!phone) {
+    try {
+      var phoneResult = await pool.query(
+        'SELECT phone FROM users WHERE telegram_id = $1',
+        [telegramId]
+      );
+      if (phoneResult.rows.length > 0 && phoneResult.rows[0].phone) {
+        phone = phoneResult.rows[0].phone;
+      }
+    } catch (e) {
+      console.error('Failed to fetch phone from DB:', e.message);
+    }
+  }
+ 
+  // Базовый URL платёжной страницы (без пути к конкретному товару -
+  // subscription определяет тариф)
+  var formUrl = process.env.PRODAMUS_BASE_URL || 'https://colibri13.payform.ru/';
  
   var params = {
     do: 'pay',
+    order_id: 'tg_' + telegramId + '_' + Date.now(),
+    sys: process.env.PRODAMUS_SYS || 'bothelp',
+    subscription: subscriptionId,
     customer_extra: String(telegramId),
   };
+ 
+  if (phone) {
+    params.customer_phone = String(phone).replace(/[^0-9]/g, '');
+  }
+ 
+  if (secretKey) {
+    params.signature = signData(params, secretKey);
+  }
  
   var query = Object.keys(params)
     .map(function (key) {
@@ -167,7 +201,7 @@ router.post('/payment/create', express.json(), async function (req, res) {
  
   var paymentUrl = formUrl + (formUrl.indexOf('?') === -1 ? '?' : '&') + query;
  
-  console.log('Payment link generated for telegram_id=' + telegramId + ':');
+  console.log('Payment link generated for telegram_id=' + telegramId + ', phone=' + (phone || 'none') + ':');
   console.log(paymentUrl);
  
   res.json({ url: paymentUrl });
