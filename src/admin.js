@@ -593,6 +593,7 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
   var COL_PHONE = headers.find(function (h) { return /телефон/i.test(h); });
   var COL_TG_ID = headers.find(function (h) { return /tg\s*id/i.test(h); });
   var COL_NEXT_PAYMENT = headers.find(function (h) { return /будущий\s*платеж/i.test(h); });
+  var COL_SUBSCRIPTION_DATE = headers.find(function (h) { return /дата\s*подписки/i.test(h); });
   var COL_ACTIVITY = headers.find(function (h) { return /активность/i.test(h); });
   var COL_FULL_NAME = headers.find(function (h) { return /(имя|фио|full.?name)/i.test(h); });
  
@@ -617,9 +618,12 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
       var row = rows[i];
  
       try {
+        await client.query('SAVEPOINT row_' + i);
+ 
         var rawPhone = COL_PHONE ? row[COL_PHONE] : null;
         var rawTgId = COL_TG_ID ? row[COL_TG_ID] : null;
         var rawNextPayment = COL_NEXT_PAYMENT ? row[COL_NEXT_PAYMENT] : null;
+        var rawSubscriptionDate = COL_SUBSCRIPTION_DATE ? row[COL_SUBSCRIPTION_DATE] : null;
         var rawActivity = COL_ACTIVITY ? row[COL_ACTIVITY] : null;
         var rawFullName = COL_FULL_NAME ? row[COL_FULL_NAME] : null;
  
@@ -631,7 +635,16 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
           continue;
         }
  
+        // "Будущий платеж" - дата следующего списания. Если пуст, значит
+        // подписка отменена в течение 30 дней с момента оплаты, и
+        // действует до "Дата подписки" + 30 дней.
         var expiresAt = parseRuDateTime(rawNextPayment);
+        if (!expiresAt) {
+          var subscriptionDate = parseRuDateTime(rawSubscriptionDate);
+          if (subscriptionDate) {
+            expiresAt = new Date(subscriptionDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+          }
+        }
         var activityStr = rawActivity || '';
         var isActive = /актив/i.test(activityStr) && !/неактив/i.test(activityStr);
         var status = isActive ? 'active' : 'expired';
@@ -656,9 +669,11 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
         }
  
         var userId;
+        var isNewUser;
  
         if (userRow) {
           userId = userRow.id;
+          isNewUser = false;
  
           // Дозаполняем недостающие поля (телефон / telegram_id / имя)
           var setClauses = [];
@@ -688,8 +703,6 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
               params
             );
           }
- 
-          updated++;
         } else {
           var insertResult = await client.query(`
             INSERT INTO users (telegram_id, phone, full_name, created_at)
@@ -698,7 +711,7 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
           `, [telegramId, phone, (rawFullName && rawFullName.trim()) || null]);
  
           userId = insertResult.rows[0].id;
-          created++;
+          isNewUser = true;
         }
  
         // --- Membership: ищем самую свежую запись для пользователя ---
@@ -718,7 +731,16 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
             VALUES ($1, $2, $3, NOW())
           `, [userId, status, expiresAt]);
         }
+ 
+        if (isNewUser) {
+          created++;
+        } else {
+          updated++;
+        }
+ 
+        await client.query('RELEASE SAVEPOINT row_' + i);
       } catch (rowErr) {
+        await client.query('ROLLBACK TO SAVEPOINT row_' + i);
         skipped++;
         if (errors.length < 20) {
           errors.push({ row: i + 2, error: rowErr.message }); // +2: заголовок + 1-индексация
