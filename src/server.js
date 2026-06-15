@@ -11,9 +11,10 @@ app.use(cors({
     'https://colibri-beauty.ru',
     'https://t.me',
     'https://colibriclub13.netlify.app',
-    /\.netlify\.app$/
+    /\.netlify\.app$/,
+    'null' // локальные HTML-файлы (file://), например админ-инструмент импорта
   ],
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Telegram-Id'],
 }));
  
