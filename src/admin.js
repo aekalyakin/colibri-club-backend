@@ -12,6 +12,102 @@ function roleAtLeast(role, required) {
   return (ROLE_LEVEL[role] || 0) >= (ROLE_LEVEL[required] || 99);
 }
  
+// ---------------------------------------------------------
+// Нормализация телефона к единому формату 7XXXXXXXXXX
+// Принимает: +79998887766, 89998887766, 79998887766, 9998887766
+// ---------------------------------------------------------
+function normalizePhone(raw) {
+  if (!raw) return null;
+  var digits = String(raw).replace(/\D/g, '');
+  if (!digits) return null;
+ 
+  if (digits.length === 11 && digits[0] === '8') {
+    return '7' + digits.slice(1);
+  }
+  if (digits.length === 11 && digits[0] === '7') {
+    return digits;
+  }
+  if (digits.length === 10) {
+    return '7' + digits;
+  }
+  return digits;
+}
+ 
+// ---------------------------------------------------------
+// Парсер одной строки CSV с учётом кавычек, разделитель ';'
+// ---------------------------------------------------------
+function parseCsvLine(line, delimiter) {
+  delimiter = delimiter || ';';
+  var result = [];
+  var current = '';
+  var inQuotes = false;
+ 
+  for (var i = 0; i < line.length; i++) {
+    var char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (char === delimiter && !inQuotes) {
+      result.push(current.trim());
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+ 
+// ---------------------------------------------------------
+// Парсер даты "ДД.ММ.ГГГГ ЧЧ:мм" (формат экспорта Prodamus)
+// ---------------------------------------------------------
+function parseRuDateTime(str) {
+  if (!str) return null;
+  var trimmed = String(str).trim();
+  if (!trimmed) return null;
+ 
+  var match = trimmed.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!match) return null;
+ 
+  var day = match[1], month = match[2], year = match[3];
+  var hour = match[4] || '0', minute = match[5] || '0';
+ 
+  return new Date(
+    parseInt(year, 10),
+    parseInt(month, 10) - 1,
+    parseInt(day, 10),
+    parseInt(hour, 10),
+    parseInt(minute, 10)
+  );
+}
+ 
+// ---------------------------------------------------------
+// Парсер всего CSV (с заголовками) в массив объектов-строк
+// ---------------------------------------------------------
+function parseSubscribersCsv(csvText) {
+  var text = csvText.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  var lines = text.split('\n').filter(function (l) { return l.trim().length > 0; });
+  if (lines.length === 0) return { headers: [], rows: [] };
+ 
+  var headers = parseCsvLine(lines[0]).map(function (h) { return h.trim(); });
+  var rows = [];
+ 
+  for (var i = 1; i < lines.length; i++) {
+    var cells = parseCsvLine(lines[i]);
+    var row = {};
+    headers.forEach(function (h, idx) {
+      row[h] = cells[idx] !== undefined ? cells[idx] : '';
+    });
+    rows.push(row);
+  }
+ 
+  return { headers: headers, rows: rows };
+}
+ 
 // Получить роль пользователя по telegram_id (null если не админ)
 async function getRole(telegramId) {
   var result = await pool.query(
@@ -20,29 +116,6 @@ async function getRole(telegramId) {
   );
   if (result.rows.length === 0) return null;
   return result.rows[0].role;
-}
- 
-// Количество владельцев в системе
-async function countOwners() {
-  var result = await pool.query("SELECT COUNT(*) FROM admins WHERE role = 'owner'");
-  return parseInt(result.rows[0].count, 10);
-}
- 
-// Нормализация телефона к виду 7XXXXXXXXXX (11 цифр, без +, начиная с 7)
-// Принимает форматы: +79998887766, 89998887766, 79998887766, с пробелами/скобками/тире
-function normalizePhone(phone) {
-  if (!phone) return null;
-  var digits = String(phone).replace(/[^0-9]/g, '');
-  if (digits.length === 11 && digits[0] === '8') {
-    digits = '7' + digits.slice(1);
-  }
-  if (digits.length === 10) {
-    digits = '7' + digits;
-  }
-  if (digits.length !== 11 || digits[0] !== '7') {
-    return null;
-  }
-  return digits;
 }
  
 // Middleware: требует роль не ниже указанной.
@@ -87,10 +160,10 @@ router.get('/admin/role/:telegramId', async function (req, res) {
 // АДМИНИСТРАТОР: проверка статуса подписки по номеру телефона
 // ---------------------------------------------------------
 router.get('/admin/check-subscription', requireRole('admin'), async function (req, res) {
-  var normalizedPhone = normalizePhone(req.query.phone);
+  var phone = normalizePhone(req.query.phone);
  
-  if (!normalizedPhone) {
-    return res.status(400).json({ error: 'Некорректный или отсутствующий номер телефона' });
+  if (!phone) {
+    return res.status(400).json({ error: 'phone обязателен' });
   }
  
   try {
@@ -99,10 +172,10 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
              m.status, m.expires_at
       FROM users u
       LEFT JOIN memberships m ON m.user_id = u.id AND m.status = 'active'
-      WHERE u.phone = $1 OR u.phone = $2
+      WHERE u.phone = $1
       ORDER BY m.expires_at DESC
       LIMIT 1
-    `, [normalizedPhone, '8' + normalizedPhone.slice(1)]); // на случай разных форматов (8.. / 7..)
+    `, [phone]);
  
     if (result.rows.length === 0) {
       return res.json({ found: false });
@@ -206,13 +279,10 @@ router.post('/admin/admins', requireRole('manager'), async function (req, res) {
  
     // Если передан телефон вместо telegram_id - ищем пользователя по телефону
     if (!resolvedTelegramId && targetPhone) {
-      var normalizedPhone = normalizePhone(targetPhone);
-      if (!normalizedPhone) {
-        return res.status(400).json({ error: 'Некорректный формат телефона' });
-      }
+      var phone = normalizePhone(targetPhone);
       var userResult = await pool.query(
-        'SELECT telegram_id FROM users WHERE phone = $1 OR phone = $2',
-        [normalizedPhone, '8' + normalizedPhone.slice(1)]
+        'SELECT telegram_id FROM users WHERE phone = $1',
+        [phone]
       );
       if (userResult.rows.length === 0) {
         return res.status(404).json({ error: 'Пользователь с таким телефоном не найден. Пользователь должен хотя бы раз открыть Mini App.' });
@@ -222,16 +292,6 @@ router.post('/admin/admins', requireRole('manager'), async function (req, res) {
  
     if (!resolvedTelegramId) {
       return res.status(400).json({ error: 'Укажите telegramId или phone' });
-    }
- 
-    // Защита: нельзя понизить роль последнего владельца -
-    // система всегда должна иметь хотя бы одного владельца
-    var currentTargetRole = await getRole(resolvedTelegramId);
-    if (currentTargetRole === 'owner' && role !== 'owner') {
-      var ownersCount = await countOwners();
-      if (ownersCount <= 1) {
-        return res.status(403).json({ error: 'Нельзя понизить последнего владельца. Сначала назначьте другого владельца.' });
-      }
     }
  
     await pool.query(`
@@ -273,15 +333,6 @@ router.delete('/admin/admins/:telegramId', requireRole('manager'), async functio
  
     if (targetRole && targetRole !== 'admin' && req.adminRole !== 'owner') {
       return res.status(403).json({ error: 'Только владелец может удалять менеджеров/владельцев' });
-    }
- 
-    // Защита: нельзя удалить последнего владельца -
-    // система всегда должна иметь хотя бы одного владельца
-    if (targetRole === 'owner') {
-      var ownersCount = await countOwners();
-      if (ownersCount <= 1) {
-        return res.status(403).json({ error: 'Нельзя удалить последнего владельца. Сначала назначьте другого владельца.' });
-      }
     }
  
     await pool.query('DELETE FROM admins WHERE telegram_id = $1', [targetTelegramId]);
@@ -520,135 +571,179 @@ router.get('/admin/export/payments.csv', requireRole('owner'), async function (r
 });
  
 // ---------------------------------------------------------
-// ВЛАДЕЛЕЦ: импорт подписчиков из CSV-выгрузки Prodamus
-// (https://colibri13.payform.ru/subscribers/csv?charset=utf-8)
-//
-// Принимает JSON-массив строк (парсинг CSV выполняется на
-// фронтенде), каждая строка содержит поля из выгрузки Prodamus:
-// phone, tgId, expiresAt ("ДД.ММ.ГГГГ ЧЧ:мм"), active (булево)
-//
-// Для каждой строки:
-// - ищем пользователя по telegram_id (если указан) или по телефону
-// - если найден - обновляем телефон/telegram_id (дозаполняем) и
-//   создаём/обновляем активное членство с датой expires_at
-// - если не найден - создаём нового пользователя
+// ВЛАДЕЛЕЦ: импорт подписчиков из CSV Prodamus (raw текст в JSON)
+// Ожидает: { csv: "Телефон;TG ID;Дата подписки;Будущий платеж;Активность (пользователь)\n..." }
 // ---------------------------------------------------------
-router.post('/admin/import-subscribers', requireRole('owner'), express.json({ limit: '5mb' }), async function (req, res) {
-  var rows = req.body.rows;
+router.post('/admin/import-subscribers-raw', requireRole('owner'), async function (req, res) {
+  var csv = req.body.csv;
  
-  if (!Array.isArray(rows)) {
-    return res.status(400).json({ error: 'rows должен быть массивом' });
+  if (!csv || typeof csv !== 'string' || !csv.trim()) {
+    return res.status(400).json({ error: 'Поле "csv" обязательно и должно быть непустой строкой' });
   }
  
-  var stats = { total: rows.length, updated: 0, created: 0, skipped: 0, errors: 0 };
+  var parsed = parseSubscribersCsv(csv);
+  var headers = parsed.headers;
+  var rows = parsed.rows;
  
-  for (var i = 0; i < rows.length; i++) {
-    var row = rows[i];
-    try {
-      var normalizedPhone = normalizePhone(row.phone);
-      var telegramId = row.tgId ? String(row.tgId).trim() : null;
+  if (rows.length === 0) {
+    return res.status(400).json({ error: 'CSV не содержит строк данных' });
+  }
  
-      if (!normalizedPhone && !telegramId) {
-        stats.skipped++;
-        continue;
-      }
+  // Определяем нужные колонки по заголовкам (регистронезависимо)
+  var COL_PHONE = headers.find(function (h) { return /телефон/i.test(h); });
+  var COL_TG_ID = headers.find(function (h) { return /tg\s*id/i.test(h); });
+  var COL_NEXT_PAYMENT = headers.find(function (h) { return /будущий\s*платеж/i.test(h); });
+  var COL_ACTIVITY = headers.find(function (h) { return /активность/i.test(h); });
+  var COL_FULL_NAME = headers.find(function (h) { return /(имя|фио|full.?name)/i.test(h); });
  
-      // Парсим дату "ДД.ММ.ГГГГ ЧЧ:мм" в expires_at
-      var expiresAt = parseRuDateTime(row.expiresAt);
-      if (!expiresAt) {
-        stats.skipped++;
-        continue;
-      }
+  if (!COL_PHONE && !COL_TG_ID) {
+    return res.status(400).json({
+      error: 'Не найдены колонки "Телефон" / "TG ID" в заголовках CSV',
+      headers: headers,
+    });
+  }
  
-      var isActive = !!row.active;
+  var updated = 0;
+  var created = 0;
+  var skipped = 0;
+  var errors = [];
  
-      // Ищем пользователя: сначала по telegram_id, затем по телефону
-      var userRow = null;
+  var client = await pool.connect();
  
-      if (telegramId) {
-        var byTg = await pool.query('SELECT id, phone FROM users WHERE telegram_id = $1', [telegramId]);
-        if (byTg.rows.length > 0) userRow = byTg.rows[0];
-      }
+  try {
+    await client.query('BEGIN');
  
-      if (!userRow && normalizedPhone) {
-        var byPhone = await pool.query(
-          'SELECT id, telegram_id FROM users WHERE phone = $1 OR phone = $2',
-          [normalizedPhone, '8' + normalizedPhone.slice(1)]
-        );
-        if (byPhone.rows.length > 0) userRow = byPhone.rows[0];
-      }
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
  
-      var userId;
+      try {
+        var rawPhone = COL_PHONE ? row[COL_PHONE] : null;
+        var rawTgId = COL_TG_ID ? row[COL_TG_ID] : null;
+        var rawNextPayment = COL_NEXT_PAYMENT ? row[COL_NEXT_PAYMENT] : null;
+        var rawActivity = COL_ACTIVITY ? row[COL_ACTIVITY] : null;
+        var rawFullName = COL_FULL_NAME ? row[COL_FULL_NAME] : null;
  
-      if (userRow) {
-        userId = userRow.id;
-        // Дозаполняем недостающие поля (телефон/telegram_id), не перетирая существующие
-        var setClauses = [];
-        var setValues = [];
-        var paramIdx = 1;
+        var phone = normalizePhone(rawPhone);
+        var telegramId = (rawTgId && String(rawTgId).trim()) ? String(rawTgId).trim() : null;
  
-        if (normalizedPhone && !userRow.phone) {
-          setClauses.push('phone = $' + (paramIdx++));
-          setValues.push(normalizedPhone);
+        if (!phone && !telegramId) {
+          skipped++;
+          continue;
         }
-        if (telegramId && !userRow.telegram_id) {
-          setClauses.push('telegram_id = $' + (paramIdx++));
-          setValues.push(telegramId);
+ 
+        var expiresAt = parseRuDateTime(rawNextPayment);
+        var activityStr = rawActivity || '';
+        var isActive = /актив/i.test(activityStr) && !/неактив/i.test(activityStr);
+        var status = isActive ? 'active' : 'expired';
+ 
+        // --- Поиск существующего пользователя: сначала по telegram_id, потом по телефону ---
+        var userRow = null;
+ 
+        if (telegramId) {
+          var byTg = await client.query(
+            'SELECT id, telegram_id, phone FROM users WHERE telegram_id = $1 LIMIT 1',
+            [telegramId]
+          );
+          if (byTg.rows.length > 0) userRow = byTg.rows[0];
         }
-        if (setClauses.length > 0) {
-          setValues.push(userId);
-          await pool.query('UPDATE users SET ' + setClauses.join(', ') + ' WHERE id = $' + paramIdx, setValues);
+ 
+        if (!userRow && phone) {
+          var byPhone = await client.query(
+            'SELECT id, telegram_id, phone FROM users WHERE phone = $1 LIMIT 1',
+            [phone]
+          );
+          if (byPhone.rows.length > 0) userRow = byPhone.rows[0];
         }
-        stats.updated++;
-      } else {
-        var insertResult = await pool.query(
-          'INSERT INTO users (telegram_id, phone) VALUES ($1, $2) RETURNING id',
-          [telegramId || null, normalizedPhone || null]
+ 
+        var userId;
+ 
+        if (userRow) {
+          userId = userRow.id;
+ 
+          // Дозаполняем недостающие поля (телефон / telegram_id / имя)
+          var setClauses = [];
+          var params = [];
+          var paramIdx = 1;
+ 
+          if (!userRow.telegram_id && telegramId) {
+            setClauses.push('telegram_id = $' + paramIdx);
+            params.push(telegramId);
+            paramIdx++;
+          }
+          if (!userRow.phone && phone) {
+            setClauses.push('phone = $' + paramIdx);
+            params.push(phone);
+            paramIdx++;
+          }
+          if (rawFullName && rawFullName.trim()) {
+            setClauses.push('full_name = COALESCE(full_name, $' + paramIdx + ')');
+            params.push(rawFullName.trim());
+            paramIdx++;
+          }
+ 
+          if (setClauses.length > 0) {
+            params.push(userId);
+            await client.query(
+              'UPDATE users SET ' + setClauses.join(', ') + ' WHERE id = $' + paramIdx,
+              params
+            );
+          }
+ 
+          updated++;
+        } else {
+          var insertResult = await client.query(`
+            INSERT INTO users (telegram_id, phone, full_name, created_at)
+            VALUES ($1, $2, $3, NOW())
+            RETURNING id
+          `, [telegramId, phone, (rawFullName && rawFullName.trim()) || null]);
+ 
+          userId = insertResult.rows[0].id;
+          created++;
+        }
+ 
+        // --- Membership: ищем самую свежую запись для пользователя ---
+        var existingMembership = await client.query(
+          'SELECT id FROM memberships WHERE user_id = $1 ORDER BY expires_at DESC NULLS LAST LIMIT 1',
+          [userId]
         );
-        userId = insertResult.rows[0].id;
-        stats.created++;
+ 
+        if (existingMembership.rows.length > 0) {
+          await client.query(
+            'UPDATE memberships SET status = $1, expires_at = $2 WHERE id = $3',
+            [status, expiresAt, existingMembership.rows[0].id]
+          );
+        } else {
+          await client.query(`
+            INSERT INTO memberships (user_id, status, expires_at, started_at)
+            VALUES ($1, $2, $3, NOW())
+          `, [userId, status, expiresAt]);
+        }
+      } catch (rowErr) {
+        skipped++;
+        if (errors.length < 20) {
+          errors.push({ row: i + 2, error: rowErr.message }); // +2: заголовок + 1-индексация
+        }
       }
- 
-      // Обновляем/создаём членство
-      var existingMembership = await pool.query(
-        "SELECT id FROM memberships WHERE user_id = $1 ORDER BY expires_at DESC LIMIT 1",
-        [userId]
-      );
- 
-      var status = isActive ? 'active' : 'expired';
- 
-      if (existingMembership.rows.length > 0) {
-        await pool.query(
-          'UPDATE memberships SET status = $1, expires_at = $2 WHERE id = $3',
-          [status, expiresAt, existingMembership.rows[0].id]
-        );
-      } else {
-        await pool.query(
-          'INSERT INTO memberships (user_id, status, expires_at) VALUES ($1, $2, $3)',
-          [userId, status, expiresAt]
-        );
-      }
-    } catch (err) {
-      console.error('Import row error:', err.message, row);
-      stats.errors++;
     }
+ 
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /admin/import-subscribers-raw error:', err);
+    return res.status(500).json({ error: 'Ошибка сервера при импорте', details: err.message });
+  } finally {
+    client.release();
   }
  
-  res.json({ ok: true, stats: stats });
+  res.json({
+    message: 'Импорт завершён',
+    total: rows.length,
+    updated: updated,
+    created: created,
+    skipped: skipped,
+    errors: errors,
+  });
 });
- 
-// Парсинг даты формата "ДД.ММ.ГГГГ ЧЧ:мм" (как в выгрузке Prodamus)
-function parseRuDateTime(str) {
-  if (!str) return null;
-  var match = String(str).trim().match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$/);
-  if (!match) return null;
-  var day = parseInt(match[1], 10);
-  var month = parseInt(match[2], 10) - 1;
-  var year = parseInt(match[3], 10);
-  var hour = parseInt(match[4], 10);
-  var minute = parseInt(match[5], 10);
-  return new Date(year, month, day, hour, minute);
-}
  
 module.exports = router;
  
