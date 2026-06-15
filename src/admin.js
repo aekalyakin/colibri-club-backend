@@ -2,16 +2,16 @@ const express = require('express');
 const router = express.Router();
 const pool = require('./db');
 require('dotenv').config();
-
+ 
 // ---------------------------------------------------------
 // Иерархия ролей: owner > manager > admin
 // ---------------------------------------------------------
 var ROLE_LEVEL = { admin: 1, manager: 2, owner: 3 };
-
+ 
 function roleAtLeast(role, required) {
   return (ROLE_LEVEL[role] || 0) >= (ROLE_LEVEL[required] || 99);
 }
-
+ 
 // Получить роль пользователя по telegram_id (null если не админ)
 async function getRole(telegramId) {
   var result = await pool.query(
@@ -21,17 +21,23 @@ async function getRole(telegramId) {
   if (result.rows.length === 0) return null;
   return result.rows[0].role;
 }
-
+ 
+// Количество владельцев в системе
+async function countOwners() {
+  var result = await pool.query("SELECT COUNT(*) FROM admins WHERE role = 'owner'");
+  return parseInt(result.rows[0].count, 10);
+}
+ 
 // Middleware: требует роль не ниже указанной.
 // Telegram ID берётся из заголовка X-Telegram-Id (передаётся фронтендом).
 function requireRole(minRole) {
   return async function (req, res, next) {
     var telegramId = req.headers['x-telegram-id'] || req.body.telegramId || req.query.telegramId;
-
+ 
     if (!telegramId) {
       return res.status(401).json({ error: 'telegramId is required' });
     }
-
+ 
     try {
       var role = await getRole(telegramId);
       if (!role || !roleAtLeast(role, minRole)) {
@@ -46,7 +52,7 @@ function requireRole(minRole) {
     }
   };
 }
-
+ 
 // ---------------------------------------------------------
 // Проверка роли текущего пользователя (для фронтенда)
 // ---------------------------------------------------------
@@ -59,17 +65,17 @@ router.get('/admin/role/:telegramId', async function (req, res) {
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // ---------------------------------------------------------
 // АДМИНИСТРАТОР: проверка статуса подписки по номеру телефона
 // ---------------------------------------------------------
 router.get('/admin/check-subscription', requireRole('admin'), async function (req, res) {
   var phone = String(req.query.phone || '').replace(/[^0-9]/g, '');
-
+ 
   if (!phone) {
     return res.status(400).json({ error: 'phone обязателен' });
   }
-
+ 
   try {
     var result = await pool.query(`
       SELECT u.full_name, u.phone, u.telegram_id,
@@ -80,14 +86,14 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
       ORDER BY m.expires_at DESC
       LIMIT 1
     `, [phone, '7' + phone.slice(1)]); // на случай разных форматов (8.. / 7..)
-
+ 
     if (result.rows.length === 0) {
       return res.json({ found: false });
     }
-
+ 
     var row = result.rows[0];
     var isActive = row.status === 'active' && new Date(row.expires_at) > new Date();
-
+ 
     res.json({
       found: true,
       fullName: row.full_name,
@@ -100,7 +106,7 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // ---------------------------------------------------------
 // АДМИНИСТРАТОР: оплаты за сегодня
 // ---------------------------------------------------------
@@ -114,14 +120,14 @@ router.get('/admin/payments/today', requireRole('admin'), async function (req, r
       WHERE p.paid_at >= CURRENT_DATE AND p.paid_at < CURRENT_DATE + INTERVAL '1 day'
       ORDER BY p.paid_at DESC
     `);
-
+ 
     res.json({ payments: result.rows });
   } catch (err) {
     console.error('GET /admin/payments/today error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // ---------------------------------------------------------
 // УПРАВЛЯЮЩИЙ: оплаты и подписчики за последние 3 дня
 // ---------------------------------------------------------
@@ -135,14 +141,14 @@ router.get('/admin/payments/recent', requireRole('manager'), async function (req
       WHERE p.created_at >= NOW() - INTERVAL '3 days'
       ORDER BY p.created_at DESC
     `);
-
+ 
     res.json({ payments: result.rows });
   } catch (err) {
     console.error('GET /admin/payments/recent error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 router.get('/admin/subscribers/recent', requireRole('manager'), async function (req, res) {
   try {
     var result = await pool.query(`
@@ -153,14 +159,14 @@ router.get('/admin/subscribers/recent', requireRole('manager'), async function (
       WHERE m.started_at >= NOW() - INTERVAL '3 days'
       ORDER BY m.started_at DESC
     `);
-
+ 
     res.json({ subscribers: result.rows });
   } catch (err) {
     console.error('GET /admin/subscribers/recent error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // ---------------------------------------------------------
 // УПРАВЛЯЮЩИЙ: назначение администраторов
 // ---------------------------------------------------------
@@ -168,19 +174,19 @@ router.post('/admin/admins', requireRole('manager'), async function (req, res) {
   var targetTelegramId = req.body.telegramId;
   var targetPhone = req.body.phone;
   var role = req.body.role || 'admin';
-
+ 
   // Только owner может назначать manager/owner; manager может назначать только admin
   if (role !== 'admin' && req.adminRole !== 'owner') {
     return res.status(403).json({ error: 'Только владелец может назначать эту роль' });
   }
-
+ 
   if (!['admin', 'manager', 'owner'].includes(role)) {
     return res.status(400).json({ error: 'Некорректная роль' });
   }
-
+ 
   try {
     var resolvedTelegramId = targetTelegramId;
-
+ 
     // Если передан телефон вместо telegram_id - ищем пользователя по телефону
     if (!resolvedTelegramId && targetPhone) {
       var phone = String(targetPhone).replace(/[^0-9]/g, '');
@@ -193,24 +199,34 @@ router.post('/admin/admins', requireRole('manager'), async function (req, res) {
       }
       resolvedTelegramId = userResult.rows[0].telegram_id;
     }
-
+ 
     if (!resolvedTelegramId) {
       return res.status(400).json({ error: 'Укажите telegramId или phone' });
     }
-
+ 
+    // Защита: нельзя понизить роль последнего владельца -
+    // система всегда должна иметь хотя бы одного владельца
+    var currentTargetRole = await getRole(resolvedTelegramId);
+    if (currentTargetRole === 'owner' && role !== 'owner') {
+      var ownersCount = await countOwners();
+      if (ownersCount <= 1) {
+        return res.status(403).json({ error: 'Нельзя понизить последнего владельца. Сначала назначьте другого владельца.' });
+      }
+    }
+ 
     await pool.query(`
       INSERT INTO admins (telegram_id, role, added_by)
       VALUES ($1, $2, $3)
       ON CONFLICT (telegram_id) DO UPDATE SET role = $2
     `, [resolvedTelegramId, role, req.adminTelegramId]);
-
+ 
     res.json({ ok: true, telegramId: resolvedTelegramId, role: role });
   } catch (err) {
     console.error('POST /admin/admins error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Список администраторов (для управления)
 router.get('/admin/admins', requireRole('manager'), async function (req, res) {
   try {
@@ -227,18 +243,27 @@ router.get('/admin/admins', requireRole('manager'), async function (req, res) {
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Удалить администратора (только owner, либо manager удаляет admin)
 router.delete('/admin/admins/:telegramId', requireRole('manager'), async function (req, res) {
   var targetTelegramId = req.params.telegramId;
-
+ 
   try {
     var targetRole = await getRole(targetTelegramId);
-
+ 
     if (targetRole && targetRole !== 'admin' && req.adminRole !== 'owner') {
       return res.status(403).json({ error: 'Только владелец может удалять менеджеров/владельцев' });
     }
-
+ 
+    // Защита: нельзя удалить последнего владельца -
+    // система всегда должна иметь хотя бы одного владельца
+    if (targetRole === 'owner') {
+      var ownersCount = await countOwners();
+      if (ownersCount <= 1) {
+        return res.status(403).json({ error: 'Нельзя удалить последнего владельца. Сначала назначьте другого владельца.' });
+      }
+    }
+ 
     await pool.query('DELETE FROM admins WHERE telegram_id = $1', [targetTelegramId]);
     res.json({ ok: true });
   } catch (err) {
@@ -246,37 +271,37 @@ router.delete('/admin/admins/:telegramId', requireRole('manager'), async functio
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // ---------------------------------------------------------
 // ВЛАДЕЛЕЦ: полная аналитика
 // ---------------------------------------------------------
 router.get('/admin/analytics/overview', requireRole('owner'), async function (req, res) {
   try {
     var totalUsers = await pool.query('SELECT COUNT(*) FROM users');
-
+ 
     var activeMemberships = await pool.query(`
       SELECT COUNT(*) FROM memberships
       WHERE status = 'active' AND expires_at > NOW()
     `);
-
+ 
     var expiredMemberships = await pool.query(`
       SELECT COUNT(*) FROM memberships
       WHERE status = 'expired' OR (status = 'active' AND expires_at <= NOW())
     `);
-
+ 
     var totalRevenue = await pool.query(`
       SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'paid'
     `);
-
+ 
     var revenueThisMonth = await pool.query(`
       SELECT COALESCE(SUM(amount), 0) as total FROM payments
       WHERE status = 'paid' AND paid_at >= DATE_TRUNC('month', NOW())
     `);
-
+ 
     var newUsersThisMonth = await pool.query(`
       SELECT COUNT(*) FROM users WHERE created_at >= DATE_TRUNC('month', NOW())
     `);
-
+ 
     res.json({
       totalUsers: parseInt(totalUsers.rows[0].count, 10),
       activeMemberships: parseInt(activeMemberships.rows[0].count, 10),
@@ -290,11 +315,11 @@ router.get('/admin/analytics/overview', requireRole('owner'), async function (re
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Выручка по дням за последние N дней (для графиков)
 router.get('/admin/analytics/revenue-by-day', requireRole('owner'), async function (req, res) {
   var days = parseInt(req.query.days, 10) || 30;
-
+ 
   try {
     var result = await pool.query(`
       SELECT TO_CHAR(paid_at, 'YYYY-MM-DD') as date, SUM(amount) as total, COUNT(*) as count
@@ -303,7 +328,7 @@ router.get('/admin/analytics/revenue-by-day', requireRole('owner'), async functi
       GROUP BY TO_CHAR(paid_at, 'YYYY-MM-DD')
       ORDER BY date ASC
     `);
-
+ 
     res.json({ data: result.rows.map(function (r) {
       return { date: r.date, total: parseFloat(r.total), count: parseInt(r.count, 10) };
     }) });
@@ -312,11 +337,11 @@ router.get('/admin/analytics/revenue-by-day', requireRole('owner'), async functi
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Выручка по месяцам (для графиков)
 router.get('/admin/analytics/revenue-by-month', requireRole('owner'), async function (req, res) {
   var months = parseInt(req.query.months, 10) || 12;
-
+ 
   try {
     var result = await pool.query(`
       SELECT TO_CHAR(paid_at, 'YYYY-MM') as month, SUM(amount) as total, COUNT(*) as count
@@ -325,7 +350,7 @@ router.get('/admin/analytics/revenue-by-month', requireRole('owner'), async func
       GROUP BY TO_CHAR(paid_at, 'YYYY-MM')
       ORDER BY month ASC
     `);
-
+ 
     res.json({ data: result.rows.map(function (r) {
       return { month: r.month, total: parseFloat(r.total), count: parseInt(r.count, 10) };
     }) });
@@ -334,13 +359,13 @@ router.get('/admin/analytics/revenue-by-month', requireRole('owner'), async func
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Полный список пользователей (с фильтрами и пагинацией)
 router.get('/admin/users', requireRole('owner'), async function (req, res) {
   var limit = Math.min(parseInt(req.query.limit, 10) || 50, 500);
   var offset = parseInt(req.query.offset, 10) || 0;
   var statusFilter = req.query.status; // active | expired | all
-
+ 
   try {
     var whereClause = '';
     if (statusFilter === 'active') {
@@ -348,7 +373,7 @@ router.get('/admin/users', requireRole('owner'), async function (req, res) {
     } else if (statusFilter === 'expired') {
       whereClause = "WHERE m.status = 'expired' OR (m.status = 'active' AND m.expires_at <= NOW())";
     }
-
+ 
     var result = await pool.query(`
       SELECT u.id, u.telegram_id, u.full_name, u.phone, u.email, u.created_at,
              m.status, m.expires_at, m.started_at
@@ -360,9 +385,9 @@ router.get('/admin/users', requireRole('owner'), async function (req, res) {
       ORDER BY u.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
-
+ 
     var countResult = await pool.query('SELECT COUNT(*) FROM users');
-
+ 
     res.json({
       users: result.rows,
       total: parseInt(countResult.rows[0].count, 10),
@@ -374,12 +399,12 @@ router.get('/admin/users', requireRole('owner'), async function (req, res) {
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // Все платежи (с пагинацией) - для CSV-экспорта
 router.get('/admin/payments/all', requireRole('owner'), async function (req, res) {
   var limit = Math.min(parseInt(req.query.limit, 10) || 100, 5000);
   var offset = parseInt(req.query.offset, 10) || 0;
-
+ 
   try {
     var result = await pool.query(`
       SELECT p.id, p.amount, p.status, p.prodamus_order_id, p.paid_at, p.created_at,
@@ -389,9 +414,9 @@ router.get('/admin/payments/all', requireRole('owner'), async function (req, res
       ORDER BY p.created_at DESC
       LIMIT $1 OFFSET $2
     `, [limit, offset]);
-
+ 
     var countResult = await pool.query('SELECT COUNT(*) FROM payments');
-
+ 
     res.json({
       payments: result.rows,
       total: parseInt(countResult.rows[0].count, 10),
@@ -403,7 +428,7 @@ router.get('/admin/payments/all', requireRole('owner'), async function (req, res
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // CSV экспорт пользователей
 router.get('/admin/export/users.csv', requireRole('owner'), async function (req, res) {
   try {
@@ -416,7 +441,7 @@ router.get('/admin/export/users.csv', requireRole('owner'), async function (req,
       )
       ORDER BY u.created_at DESC
     `);
-
+ 
     var header = 'telegram_id,full_name,phone,email,registered_at,membership_status,expires_at\n';
     var rows = result.rows.map(function (r) {
       return [
@@ -429,7 +454,7 @@ router.get('/admin/export/users.csv', requireRole('owner'), async function (req,
         r.expires_at ? new Date(r.expires_at).toISOString() : ''
       ].join(',');
     }).join('\n');
-
+ 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="colibri-users.csv"');
     res.send('\uFEFF' + header + rows); // BOM для корректного открытия в Excel с кириллицей
@@ -438,7 +463,7 @@ router.get('/admin/export/users.csv', requireRole('owner'), async function (req,
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 // CSV экспорт платежей
 router.get('/admin/export/payments.csv', requireRole('owner'), async function (req, res) {
   try {
@@ -449,7 +474,7 @@ router.get('/admin/export/payments.csv', requireRole('owner'), async function (r
       JOIN users u ON u.id = p.user_id
       ORDER BY p.created_at DESC
     `);
-
+ 
     var header = 'id,telegram_id,full_name,phone,amount,status,order_id,paid_at,created_at\n';
     var rows = result.rows.map(function (r) {
       return [
@@ -464,7 +489,7 @@ router.get('/admin/export/payments.csv', requireRole('owner'), async function (r
         r.created_at ? new Date(r.created_at).toISOString() : ''
       ].join(',');
     }).join('\n');
-
+ 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', 'attachment; filename="colibri-payments.csv"');
     res.send('\uFEFF' + header + rows);
@@ -473,5 +498,6 @@ router.get('/admin/export/payments.csv', requireRole('owner'), async function (r
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
-
+ 
 module.exports = router;
+ 
