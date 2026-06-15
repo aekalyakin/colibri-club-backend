@@ -86,18 +86,26 @@ function parseRuDateTime(str) {
 }
  
 // ---------------------------------------------------------
-// Парсер всего CSV (с заголовками) в массив объектов-строк
+// Парсер всего CSV (с заголовками) в массив объектов-строк.
+// Авто-определяет разделитель: Prodamus экспортирует с
+// табуляцией (\t), но поддерживаем и ';' на случай других форматов.
 // ---------------------------------------------------------
 function parseSubscribersCsv(csvText) {
   var text = csvText.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   var lines = text.split('\n').filter(function (l) { return l.trim().length > 0; });
   if (lines.length === 0) return { headers: [], rows: [] };
  
-  var headers = parseCsvLine(lines[0]).map(function (h) { return h.trim(); });
+  // Определяем разделитель по первой строке: чей символ встречается чаще
+  var firstLine = lines[0];
+  var tabCount = (firstLine.match(/\t/g) || []).length;
+  var semiCount = (firstLine.match(/;/g) || []).length;
+  var delimiter = tabCount >= semiCount ? '\t' : ';';
+ 
+  var headers = parseCsvLine(lines[0], delimiter).map(function (h) { return h.trim(); });
   var rows = [];
  
   for (var i = 1; i < lines.length; i++) {
-    var cells = parseCsvLine(lines[i]);
+    var cells = parseCsvLine(lines[i], delimiter);
     var row = {};
     headers.forEach(function (h, idx) {
       row[h] = cells[idx] !== undefined ? cells[idx] : '';
