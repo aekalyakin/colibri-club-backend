@@ -4,23 +4,6 @@ const pool = require('./db');
 require('dotenv').config();
  
 // ---------------------------------------------------------
-// CORS: разрешаем запросы с любого источника (нужно, например,
-// для локальной HTML-страницы импорта подписчиков, открытой
-// напрямую из файловой системы - origin "null" или file://)
-// ---------------------------------------------------------
-router.use(function (req, res, next) {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Telegram-Id');
- 
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204);
-  }
- 
-  next();
-});
- 
-// ---------------------------------------------------------
 // Иерархия ролей: owner > manager > admin
 // ---------------------------------------------------------
 var ROLE_LEVEL = { admin: 1, manager: 2, owner: 3 };
