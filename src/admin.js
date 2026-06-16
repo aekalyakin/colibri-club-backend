@@ -391,21 +391,24 @@ router.get('/admin/analytics/overview', requireRole('owner'), async function (re
       SELECT COALESCE(SUM(amount), 0) as total FROM payments WHERE status = 'paid'
     `);
 
-    var revenueThisMonth = await pool.query(`
-      SELECT COALESCE(SUM(amount), 0) as total FROM payments
-      WHERE status = 'paid' AND paid_at >= DATE_TRUNC('month', NOW())
-    `);
-
     var newUsersThisMonth = await pool.query(`
       SELECT COUNT(*) FROM users WHERE created_at >= DATE_TRUNC('month', NOW())
     `);
 
+    // "Выручка за месяц" = расчётный месячный доход по активным подпискам
+    // прямо сейчас (старые активные клиенты + новые в этом месяце,
+    // за вычетом тех, кто перешёл в статус "неактивен"). По сути это
+    // MRR: количество активных подписок × стоимость подписки (390₽).
+    var SUBSCRIPTION_PRICE = 390;
+    var activeCount = parseInt(activeMemberships.rows[0].count, 10);
+    var revenueThisMonth = activeCount * SUBSCRIPTION_PRICE;
+
     res.json({
       totalUsers: parseInt(totalUsers.rows[0].count, 10),
-      activeMemberships: parseInt(activeMemberships.rows[0].count, 10),
+      activeMemberships: activeCount,
       expiredMemberships: parseInt(expiredMemberships.rows[0].count, 10),
       totalRevenue: parseFloat(totalRevenue.rows[0].total),
-      revenueThisMonth: parseFloat(revenueThisMonth.rows[0].total),
+      revenueThisMonth: revenueThisMonth,
       newUsersThisMonth: parseInt(newUsersThisMonth.rows[0].count, 10),
     });
   } catch (err) {
@@ -454,6 +457,34 @@ router.get('/admin/analytics/revenue-by-month', requireRole('owner'), async func
     }) });
   } catch (err) {
     console.error('GET /admin/analytics/revenue-by-month error:', err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Ожидаемые оплаты в ближайшие N дней — по дате окончания активных подписок
+// (приближается expires_at => скоро будет автосписание следующего платежа)
+router.get('/admin/analytics/upcoming-payments', requireRole('owner'), async function (req, res) {
+  var days = parseInt(req.query.days, 10) || 3;
+  var SUBSCRIPTION_PRICE = 390;
+
+  try {
+    var result = await pool.query(`
+      SELECT COUNT(*) as count
+      FROM memberships
+      WHERE status = 'active'
+        AND expires_at > NOW()
+        AND expires_at <= NOW() + INTERVAL '${days} days'
+    `);
+
+    var count = parseInt(result.rows[0].count, 10);
+
+    res.json({
+      count: count,
+      total: count * SUBSCRIPTION_PRICE,
+      days: days,
+    });
+  } catch (err) {
+    console.error('GET /admin/analytics/upcoming-payments error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
