@@ -255,8 +255,8 @@ router.get('/admin/payments/recent', requireRole('manager'), async function (req
              u.full_name, u.phone, u.telegram_id
       FROM payments p
       JOIN users u ON u.id = p.user_id
-      WHERE p.created_at >= NOW() - INTERVAL '3 days'
-      ORDER BY p.created_at DESC
+      WHERE p.paid_at >= NOW() - INTERVAL '3 days'
+      ORDER BY p.paid_at DESC
     `);
 
     res.json({ payments: result.rows });
