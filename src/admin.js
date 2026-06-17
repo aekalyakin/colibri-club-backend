@@ -63,6 +63,26 @@ function parseCsvLine(line, delimiter) {
 }
 
 // ---------------------------------------------------------
+// Prodamus указывает все даты по московскому времени (MSK, UTC+3,
+// Россия не переходит на летнее время) БЕЗ явной отметки часового
+// пояса в строке ("16.07.2026 19:36", "2026-06-16 19:36:59" и т.п.).
+// Конструктор new Date(year, month, day, hour, ...) интерпретирует
+// переданные числа как время В ЧАСОВОМ ПОЯСЕ СЕРВЕРА, а не как
+// московское время - если сервер работает не в зоне Europe/Moscow
+// (например, в UTC, как обычно по умолчанию в облачных контейнерах),
+// это даёт системную ошибку в несколько часов в абсолютном времени.
+// Подписка может в реальности действовать "до 17:40", и эта точность
+// важна - поэтому здесь явно переводим разобранное "наивное"
+// московское время в корректный UTC-момент, независимо от того, в
+// каком часовом поясе физически запущен сервер.
+// ---------------------------------------------------------
+var MSK_OFFSET_MS = 3 * 60 * 60 * 1000;
+
+function mskToUtcDate(year, month, day, hour, minute, second) {
+  return new Date(Date.UTC(year, month, day, hour || 0, minute || 0, second || 0) - MSK_OFFSET_MS);
+}
+
+// ---------------------------------------------------------
 // Парсер дат из CSV Prodamus. Поддерживает два формата:
 // - "ДД.ММ.ГГГГ ЧЧ:мм" (например, "14.07.2026 18:13")
 // - "ГГГГ-ММ-ДД ЧЧ:мм:сс" (например, "2026-06-15 10:08:57")
@@ -77,12 +97,13 @@ function parseRuDateTime(str) {
   if (ruMatch) {
     var day = ruMatch[1], month = ruMatch[2], year = ruMatch[3];
     var hour = ruMatch[4] || '0', minute = ruMatch[5] || '0';
-    return new Date(
+    return mskToUtcDate(
       parseInt(year, 10),
       parseInt(month, 10) - 1,
       parseInt(day, 10),
       parseInt(hour, 10),
-      parseInt(minute, 10)
+      parseInt(minute, 10),
+      0
     );
   }
 
@@ -91,7 +112,7 @@ function parseRuDateTime(str) {
   if (isoMatch) {
     var isoYear = isoMatch[1], isoMonth = isoMatch[2], isoDay = isoMatch[3];
     var isoHour = isoMatch[4] || '0', isoMinute = isoMatch[5] || '0', isoSecond = isoMatch[6] || '0';
-    return new Date(
+    return mskToUtcDate(
       parseInt(isoYear, 10),
       parseInt(isoMonth, 10) - 1,
       parseInt(isoDay, 10),
@@ -852,13 +873,13 @@ router.post('/admin/import-subscribers-raw', requireRole('owner'), async functio
 // paid_at = "Подписка" - 30 дней).
 // ---------------------------------------------------------
 
-// Парсер даты "ГГГГ-ММ-ДД" в Date (без времени)
+// Парсер даты "ГГГГ-ММ-ДД" в Date (без времени, начало суток по МСК)
 function parseSimpleDate(str) {
   if (!str) return null;
   var trimmed = String(str).trim();
   var m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
   if (!m) return null;
-  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+  return mskToUtcDate(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10), 0, 0, 0);
 }
 
 // ---------------------------------------------------------
@@ -1132,7 +1153,7 @@ function parsePaylistDate(str) {
   var trimmed = String(str).trim();
   var m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
   if (!m) return null;
-  return new Date(
+  return mskToUtcDate(
     parseInt(m[1], 10),
     parseInt(m[2], 10) - 1,
     parseInt(m[3], 10),
