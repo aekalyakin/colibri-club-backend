@@ -1142,16 +1142,20 @@ function parsePaylistDate(str) {
   );
 }
 
-// Извлечение telegram_id из строки paylist.csv
+// Извлечение telegram_id из строки paylist.csv.
+// Реальные Telegram ID состоят минимум из 5+ цифр (на практике 8-10) -
+// это отсекает мусорные значения вроде "1" в "Дополнительные данные",
+// которые иногда встречаются в выгрузке Prodamus и не являются
+// telegram_id (вероятно, артефакт другого поля).
 function extractTelegramIdFromPaylistRow(row) {
   var tgUserId = (row['tg_user_id'] || '').trim();
-  if (tgUserId && /^\d+$/.test(tgUserId)) return tgUserId;
+  if (tgUserId && /^\d{5,}$/.test(tgUserId)) return tgUserId;
 
   var extra = (row['Дополнительные данные'] || '').trim();
-  if (extra && /^\d+$/.test(extra)) return extra;
+  if (extra && /^\d{5,}$/.test(extra)) return extra;
 
   var orderNum = (row['Номер заказа'] || '').trim();
-  var m = orderNum.match(/^tg_(\d+)_/);
+  var m = orderNum.match(/^tg_(\d{5,})_/);
   if (m) return m[1];
 
   return null;
@@ -1285,8 +1289,25 @@ router.post('/admin/import-full-database', requireRole('owner'), async function 
           continue;
         }
 
-        // --- Находим или создаём пользователя по телефону ---
+        // --- Находим или создаём пользователя ---
+        // Приоритет: сначала ищем по telegram_id из этой строки (если
+        // удалось определить) - это подлинный идентификатор личности
+        // в системе. Телефон у одного и того же человека может
+        // отличаться между разными платежами (смена номера, оплата с
+        // другой карты), поэтому матчинг только по телефону может
+        // привести к попытке создать дубликат пользователя с уже
+        // существующим telegram_id (нарушение UNIQUE-ограничения).
+        // Если по telegram_id не нашли - ищем по телефону. Если и
+        // так не нашли - создаём нового пользователя.
+        var telegramIdForRow = extractTelegramIdFromPaylistRow(row);
+        var emailForRow = (rawEmail && rawEmail.trim()) || null;
+
         var userId = userIdByPhone[phone];
+
+        if (!userId && telegramIdForRow) {
+          var byTg = await client.query('SELECT id FROM users WHERE telegram_id = $1 LIMIT 1', [telegramIdForRow]);
+          if (byTg.rows.length > 0) userId = byTg.rows[0].id;
+        }
 
         if (!userId) {
           var byPhone = await client.query('SELECT id FROM users WHERE phone = $1 LIMIT 1', [phone]);
@@ -1294,25 +1315,22 @@ router.post('/admin/import-full-database', requireRole('owner'), async function 
           if (byPhone.rows.length > 0) {
             userId = byPhone.rows[0].id;
           } else {
-            var telegramId = extractTelegramIdFromPaylistRow(row);
-            var email = (rawEmail && rawEmail.trim()) || null;
-
             var inserted = await client.query(
               'INSERT INTO users (telegram_id, phone, email, created_at) VALUES ($1, $2, $3, $4) RETURNING id',
-              [telegramId, phone, email, paidAt]
+              [telegramIdForRow, phone, emailForRow, paidAt]
             );
             userId = inserted.rows[0].id;
             usersCreated++;
           }
-
-          userIdByPhone[phone] = userId;
         }
 
-        // Если телефон уже привязан к пользователю, но у него ещё нет
-        // telegram_id/email - дозаполняем при наличии данных в этой строке
-        var telegramIdForRow = extractTelegramIdFromPaylistRow(row);
-        var emailForRow = (rawEmail && rawEmail.trim()) || null;
-        if (telegramIdForRow || emailForRow) {
+        userIdByPhone[phone] = userId;
+
+        // Дозаполняем недостающие telegram_id/email/phone у найденного
+        // пользователя, если в этой строке платежа есть данные, а в
+        // профиле они ещё не заполнены (никогда не перезатираем уже
+        // имеющиеся значения)
+        if (telegramIdForRow || emailForRow || phone) {
           var setClauses = [];
           var params = [];
           var idx = 1;
@@ -1324,6 +1342,11 @@ router.post('/admin/import-full-database', requireRole('owner'), async function 
           if (emailForRow) {
             setClauses.push('email = COALESCE(email, $' + idx + ')');
             params.push(emailForRow);
+            idx++;
+          }
+          if (phone) {
+            setClauses.push('phone = COALESCE(phone, $' + idx + ')');
+            params.push(phone);
             idx++;
           }
           params.push(userId);
