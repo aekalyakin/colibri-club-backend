@@ -1083,4 +1083,394 @@ router.post('/admin/import-payments-history', requireRole('owner'), async functi
   });
 });
 
+// ---------------------------------------------------------
+// ВЛАДЕЛЕЦ: полный импорт базы подписчиков из двух CSV-файлов
+// Prodamus:
+//   - paylist: полная история платежей (paylist.csv), разделитель ';',
+//     одна строка = один платёж. Колонки (среди прочих): "ID заказа",
+//     "Дата", "Телефон", "E-mail", "Сумма", "Статус", "Тип платежа",
+//     "Дополнительные данные", "Номер заказа", "tg_user_id".
+//   - subscribers: текущий снимок статуса подписок (тот же формат,
+//     что используется в /admin/import-subscribers-raw), разделитель
+//     ';' или TAB. Содержит "Телефон", "Дата подписки",
+//     "Будущий платеж", "Активность (пользователь)",
+//     "Активность (менеджер)".
+//
+// Ожидает: { paylistCsv: "...", subscribersCsv: "...", debug: true|false }
+//
+// Логика:
+//   1. Перед загрузкой удаляются ранее импортированные синтетические
+//      записи платежей (prodamus_order_id LIKE 'bx_import_%'), которые
+//      дублируют события из paylist.csv, чтобы не задвоить выручку.
+//   2. Каждая строка paylist с успешным статусом ("Получен", "Обработан",
+//      "Выплачен") создаёт запись в payments (status='paid'), строки со
+//      статусом "Возвращен"/"Частично возвращен" - со status='refunded'
+//      (не попадают в выручку благодаря фильтру status='paid' в аналитике).
+//   3. Пользователь ищется по нормализованному телефону. Если не найден -
+//      создаётся новая запись в users (телефон, e-mail; telegram_id -
+//      если удалось определить из строки платежа, иначе NULL).
+//   4. telegram_id для строки платежа определяется в порядке: колонка
+//      tg_user_id -> колонка "Дополнительные данные" (если чисто
+//      цифровая) -> парсинг "Номер заказа" по паттерну tg_<id>_<ts>.
+//   5. После импорта платежей для каждого пользователя:
+//      users.created_at = самая ранняя дата платежа (если она раньше
+//      текущего значения).
+//   6. Применяется снимок subscribers.csv: для каждого телефона
+//      обновляется/создаётся последняя запись membership:
+//      expires_at = "Будущий платеж" (если указан) иначе
+//      "Дата подписки" + 30 дней; started_at = самая ранняя дата
+//      платежа этого пользователя (из paylist), либо "Дата подписки"
+//      - 30 дней, если платежей не найдено; status='active' всегда
+//      (реальная активность определяется сравнением expires_at с
+//      текущим моментом в запросах аналитики).
+// ---------------------------------------------------------
+
+// Парсер даты "ГГГГ-ММ-ДД ЧЧ:мм:сс" (используется в paylist "Дата" и
+// subscribers "Дата подписки")
+function parsePaylistDate(str) {
+  if (!str) return null;
+  var trimmed = String(str).trim();
+  var m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m) return null;
+  return new Date(
+    parseInt(m[1], 10),
+    parseInt(m[2], 10) - 1,
+    parseInt(m[3], 10),
+    parseInt(m[4] || '0', 10),
+    parseInt(m[5] || '0', 10),
+    parseInt(m[6] || '0', 10)
+  );
+}
+
+// Извлечение telegram_id из строки paylist.csv
+function extractTelegramIdFromPaylistRow(row) {
+  var tgUserId = (row['tg_user_id'] || '').trim();
+  if (tgUserId && /^\d+$/.test(tgUserId)) return tgUserId;
+
+  var extra = (row['Дополнительные данные'] || '').trim();
+  if (extra && /^\d+$/.test(extra)) return extra;
+
+  var orderNum = (row['Номер заказа'] || '').trim();
+  var m = orderNum.match(/^tg_(\d+)_/);
+  if (m) return m[1];
+
+  return null;
+}
+
+router.post('/admin/import-full-database', requireRole('owner'), async function (req, res) {
+  var paylistCsv = req.body.paylistCsv;
+  var subscribersCsv = req.body.subscribersCsv;
+
+  if (!paylistCsv || typeof paylistCsv !== 'string' || !paylistCsv.trim()) {
+    return res.status(400).json({ error: 'Поле "paylistCsv" обязательно и должно быть непустой строкой' });
+  }
+  if (!subscribersCsv || typeof subscribersCsv !== 'string' || !subscribersCsv.trim()) {
+    return res.status(400).json({ error: 'Поле "subscribersCsv" обязательно и должно быть непустой строкой' });
+  }
+
+  var paylistParsed = parseSubscribersCsv(paylistCsv); // авто-определение разделителя
+  var paylistRows = paylistParsed.rows;
+
+  var subsParsed = parseSubscribersCsv(subscribersCsv);
+  var subsRows = subsParsed.rows;
+
+  if (paylistRows.length === 0) {
+    return res.status(400).json({ error: 'paylistCsv не содержит строк данных' });
+  }
+  if (subsRows.length === 0) {
+    return res.status(400).json({ error: 'subscribersCsv не содержит строк данных' });
+  }
+
+  var paylistHeaders = paylistParsed.headers;
+  var COL_ORDER_ID = paylistHeaders.find(function (h) { return /id\s*заказа/i.test(h); });
+  var COL_DATE = paylistHeaders.find(function (h) { return /^дата$/i.test(h); });
+  var COL_PHONE = paylistHeaders.find(function (h) { return /телефон/i.test(h); });
+  var COL_EMAIL = paylistHeaders.find(function (h) { return /e-?mail/i.test(h); });
+  var COL_AMOUNT = paylistHeaders.find(function (h) { return /^сумма$/i.test(h); });
+  var COL_STATUS = paylistHeaders.find(function (h) { return /^статус$/i.test(h); });
+
+  if (!COL_ORDER_ID || !COL_DATE || !COL_PHONE || !COL_AMOUNT || !COL_STATUS) {
+    return res.status(400).json({
+      error: 'Не найдены обязательные колонки в paylistCsv ("ID заказа", "Дата", "Телефон", "Сумма", "Статус")',
+      headers: paylistHeaders,
+    });
+  }
+
+  var subsHeaders = subsParsed.headers;
+  var SCOL_PHONE = subsHeaders.find(function (h) { return /телефон/i.test(h); });
+  var SCOL_SUB_DATE = subsHeaders.find(function (h) { return /дата\s*подписки/i.test(h); });
+  var SCOL_NEXT_PAYMENT = subsHeaders.find(function (h) { return /будущий\s*платеж/i.test(h); });
+
+  if (!SCOL_PHONE || !SCOL_SUB_DATE) {
+    return res.status(400).json({
+      error: 'Не найдены обязательные колонки в subscribersCsv ("Телефон", "Дата подписки")',
+      headers: subsHeaders,
+    });
+  }
+
+  // --- Режим диагностики ---
+  if (req.body.debug) {
+    return res.json({
+      paylist: {
+        delimiter: paylistParsed.delimiter === '\t' ? 'TAB' : paylistParsed.delimiter,
+        headers: paylistHeaders,
+        detectedColumns: { orderId: COL_ORDER_ID, date: COL_DATE, phone: COL_PHONE, email: COL_EMAIL, amount: COL_AMOUNT, status: COL_STATUS },
+        totalRows: paylistRows.length,
+        sampleRows: paylistRows.slice(0, 3),
+      },
+      subscribers: {
+        delimiter: subsParsed.delimiter === '\t' ? 'TAB' : subsParsed.delimiter,
+        headers: subsHeaders,
+        detectedColumns: { phone: SCOL_PHONE, subDate: SCOL_SUB_DATE, nextPayment: SCOL_NEXT_PAYMENT },
+        totalRows: subsRows.length,
+        sampleRows: subsRows.slice(0, 3),
+      },
+    });
+  }
+
+  var SUCCESS_STATUSES = ['получен', 'обработан', 'выплачен'];
+  var REFUND_STATUSES = ['возвращен', 'частично возвращен'];
+
+  var imported = 0;
+  var refunded = 0;
+  var skipped = 0;
+  var usersCreated = 0;
+  var errors = [];
+
+  // userId -> самая ранняя дата платежа (для users.created_at / memberships.started_at)
+  var earliestPaymentByUser = {};
+  // phone -> userId (кеш для второго прохода по subscribers.csv)
+  var userIdByPhone = {};
+
+  var client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Шаг 1: удаляем старые синтетические записи из предыдущего импорта
+    // (Bitrix-таблица), чтобы не задвоить выручку с данными из paylist.csv
+    var deleted = await client.query("DELETE FROM payments WHERE prodamus_order_id LIKE 'bx_import_%'");
+    var deletedCount = deleted.rowCount || 0;
+
+    // Шаг 2: импорт платежей из paylist.csv
+    for (var i = 0; i < paylistRows.length; i++) {
+      var row = paylistRows[i];
+
+      try {
+        await client.query('SAVEPOINT row_' + i);
+
+        var rawPhone = row[COL_PHONE];
+        var rawEmail = COL_EMAIL ? row[COL_EMAIL] : null;
+        var rawDate = row[COL_DATE];
+        var rawAmount = row[COL_AMOUNT];
+        var rawStatus = (row[COL_STATUS] || '').trim().toLowerCase();
+        var orderId = (row[COL_ORDER_ID] || '').trim();
+
+        var phone = normalizePhone(rawPhone);
+        var paidAt = parsePaylistDate(rawDate);
+        var amount = parseFloat(String(rawAmount).replace(',', '.')) || 390;
+
+        if (!phone || !paidAt || !orderId) {
+          skipped++;
+          await client.query('RELEASE SAVEPOINT row_' + i);
+          continue;
+        }
+
+        var isSuccess = SUCCESS_STATUSES.indexOf(rawStatus) !== -1;
+        var isRefund = REFUND_STATUSES.indexOf(rawStatus) !== -1;
+
+        if (!isSuccess && !isRefund) {
+          skipped++;
+          await client.query('RELEASE SAVEPOINT row_' + i);
+          continue;
+        }
+
+        // --- Находим или создаём пользователя по телефону ---
+        var userId = userIdByPhone[phone];
+
+        if (!userId) {
+          var byPhone = await client.query('SELECT id FROM users WHERE phone = $1 LIMIT 1', [phone]);
+
+          if (byPhone.rows.length > 0) {
+            userId = byPhone.rows[0].id;
+          } else {
+            var telegramId = extractTelegramIdFromPaylistRow(row);
+            var email = (rawEmail && rawEmail.trim()) || null;
+
+            var inserted = await client.query(
+              'INSERT INTO users (telegram_id, phone, email, created_at) VALUES ($1, $2, $3, $4) RETURNING id',
+              [telegramId, phone, email, paidAt]
+            );
+            userId = inserted.rows[0].id;
+            usersCreated++;
+          }
+
+          userIdByPhone[phone] = userId;
+        }
+
+        // Если телефон уже привязан к пользователю, но у него ещё нет
+        // telegram_id/email - дозаполняем при наличии данных в этой строке
+        var telegramIdForRow = extractTelegramIdFromPaylistRow(row);
+        var emailForRow = (rawEmail && rawEmail.trim()) || null;
+        if (telegramIdForRow || emailForRow) {
+          var setClauses = [];
+          var params = [];
+          var idx = 1;
+          if (telegramIdForRow) {
+            setClauses.push('telegram_id = COALESCE(telegram_id, $' + idx + ')');
+            params.push(telegramIdForRow);
+            idx++;
+          }
+          if (emailForRow) {
+            setClauses.push('email = COALESCE(email, $' + idx + ')');
+            params.push(emailForRow);
+            idx++;
+          }
+          params.push(userId);
+          await client.query('UPDATE users SET ' + setClauses.join(', ') + ' WHERE id = $' + idx, params);
+        }
+
+        // --- Создаём запись платежа (идемпотентно по order_id) ---
+        var paymentStatus = isSuccess ? 'paid' : 'refunded';
+
+        await client.query(`
+          INSERT INTO payments (user_id, prodamus_order_id, amount, status, paid_at)
+          VALUES ($1, $2, $3, $4, $5)
+          ON CONFLICT (prodamus_order_id) DO UPDATE SET status = $4, paid_at = $5, amount = $3
+        `, [userId, orderId, amount, paymentStatus, paidAt]);
+
+        if (isSuccess) imported++;
+        else refunded++;
+
+        if (!earliestPaymentByUser[userId] || paidAt < earliestPaymentByUser[userId]) {
+          earliestPaymentByUser[userId] = paidAt;
+        }
+
+        await client.query('RELEASE SAVEPOINT row_' + i);
+      } catch (rowErr) {
+        await client.query('ROLLBACK TO SAVEPOINT row_' + i);
+        skipped++;
+        if (errors.length < 30) {
+          errors.push({ source: 'paylist', row: i + 2, error: rowErr.message });
+        }
+      }
+    }
+
+    // Шаг 3: применяем текущий снимок статусов из subscribers.csv
+    var membershipsUpdated = 0;
+    var membershipsCreated = 0;
+    var subsSkipped = 0;
+
+    for (var j = 0; j < subsRows.length; j++) {
+      var srow = subsRows[j];
+
+      try {
+        await client.query('SAVEPOINT srow_' + j);
+
+        var sRawPhone = srow[SCOL_PHONE];
+        var sPhone = normalizePhone(sRawPhone);
+        var subDate = parsePaylistDate(srow[SCOL_SUB_DATE]);
+        var nextPaymentRaw = SCOL_NEXT_PAYMENT ? srow[SCOL_NEXT_PAYMENT] : null;
+        var expiresAt = parseRuDateTime(nextPaymentRaw);
+
+        if (!sPhone) {
+          subsSkipped++;
+          await client.query('RELEASE SAVEPOINT srow_' + j);
+          continue;
+        }
+
+        if (!expiresAt && subDate) {
+          expiresAt = new Date(subDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+        }
+        if (!expiresAt) {
+          subsSkipped++;
+          await client.query('RELEASE SAVEPOINT srow_' + j);
+          continue;
+        }
+
+        var sUserId = userIdByPhone[sPhone];
+        if (!sUserId) {
+          var byPhone2 = await client.query('SELECT id FROM users WHERE phone = $1 LIMIT 1', [sPhone]);
+          if (byPhone2.rows.length > 0) {
+            sUserId = byPhone2.rows[0].id;
+            userIdByPhone[sPhone] = sUserId;
+          }
+        }
+
+        if (!sUserId) {
+          // телефон встретился только в снимке подписок, но не в истории
+          // платежей и не в users - создаём пользователя по минимальным данным
+          var insertedS = await client.query(
+            'INSERT INTO users (phone, created_at) VALUES ($1, $2) RETURNING id',
+            [sPhone, subDate || new Date()]
+          );
+          sUserId = insertedS.rows[0].id;
+          userIdByPhone[sPhone] = sUserId;
+          usersCreated++;
+        }
+
+        var startedAt = earliestPaymentByUser[sUserId] || (subDate ? new Date(subDate.getTime() - 30 * 24 * 60 * 60 * 1000) : new Date());
+
+        var existingMembership = await client.query(
+          'SELECT id FROM memberships WHERE user_id = $1 ORDER BY expires_at DESC NULLS LAST LIMIT 1',
+          [sUserId]
+        );
+
+        if (existingMembership.rows.length > 0) {
+          await client.query(
+            "UPDATE memberships SET status = 'active', expires_at = $1, started_at = LEAST(started_at, $2) WHERE id = $3",
+            [expiresAt, startedAt, existingMembership.rows[0].id]
+          );
+          membershipsUpdated++;
+        } else {
+          await client.query(
+            "INSERT INTO memberships (user_id, status, expires_at, started_at) VALUES ($1, 'active', $2, $3)",
+            [sUserId, expiresAt, startedAt]
+          );
+          membershipsCreated++;
+        }
+
+        // Подчищаем created_at пользователя, если есть более ранняя дата
+        await client.query('UPDATE users SET created_at = LEAST(created_at, $1) WHERE id = $2', [startedAt, sUserId]);
+
+        await client.query('RELEASE SAVEPOINT srow_' + j);
+      } catch (sErr) {
+        await client.query('ROLLBACK TO SAVEPOINT srow_' + j);
+        subsSkipped++;
+        if (errors.length < 30) {
+          errors.push({ source: 'subscribers', row: j + 2, error: sErr.message });
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      message: 'Полный импорт базы подписчиков завершён',
+      deletedOldBitrixPayments: deletedCount,
+      payments: {
+        totalRows: paylistRows.length,
+        imported: imported,
+        refunded: refunded,
+        skipped: skipped,
+      },
+      subscribers: {
+        totalRows: subsRows.length,
+        membershipsUpdated: membershipsUpdated,
+        membershipsCreated: membershipsCreated,
+        skipped: subsSkipped,
+      },
+      usersCreated: usersCreated,
+      errors: errors,
+    });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('POST /admin/import-full-database error:', err);
+    return res.status(500).json({ error: 'Ошибка сервера при импорте', details: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+
 module.exports = router;
