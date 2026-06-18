@@ -216,7 +216,7 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
 
   try {
     var result = await pool.query(`
-      SELECT u.full_name, u.phone, u.telegram_id,
+      SELECT u.id, u.full_name, u.phone, u.telegram_id,
              m.status, m.expires_at
       FROM users u
       LEFT JOIN memberships m ON m.user_id = u.id AND m.status = 'active'
@@ -234,6 +234,7 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
 
     res.json({
       found: true,
+      id: row.id,
       fullName: row.full_name,
       phone: row.phone,
       active: isActive,
@@ -251,7 +252,7 @@ router.get('/admin/check-subscription', requireRole('admin'), async function (re
 router.get('/admin/payments/today', requireRole('admin'), async function (req, res) {
   try {
     var result = await pool.query(`
-      SELECT p.amount, p.status, p.paid_at, p.created_at,
+      SELECT u.id, p.amount, p.status, p.paid_at, p.created_at,
              u.full_name, u.phone, u.telegram_id
       FROM payments p
       JOIN users u ON u.id = p.user_id
@@ -272,7 +273,7 @@ router.get('/admin/payments/today', requireRole('admin'), async function (req, r
 router.get('/admin/payments/recent', requireRole('manager'), async function (req, res) {
   try {
     var result = await pool.query(`
-      SELECT p.amount, p.status, p.paid_at, p.created_at,
+      SELECT u.id, p.amount, p.status, p.paid_at, p.created_at,
              u.full_name, u.phone, u.telegram_id
       FROM payments p
       JOIN users u ON u.id = p.user_id
@@ -290,7 +291,7 @@ router.get('/admin/payments/recent', requireRole('manager'), async function (req
 router.get('/admin/subscribers/recent', requireRole('manager'), async function (req, res) {
   try {
     var result = await pool.query(`
-      SELECT u.full_name, u.phone, u.telegram_id, u.email,
+      SELECT u.id, u.full_name, u.phone, u.telegram_id, u.email,
              m.status, m.expires_at, m.started_at
       FROM users u
       LEFT JOIN memberships m ON m.user_id = u.id
@@ -301,6 +302,154 @@ router.get('/admin/subscribers/recent', requireRole('manager'), async function (
     res.json({ subscribers: result.rows });
   } catch (err) {
     console.error('GET /admin/subscribers/recent error:', err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ---------------------------------------------------------
+// АДМИНИСТРАТОР: карточка конкретного клиента (для всплывающего
+// окна "личный кабинет клиента" в админ-панели). Принимает один из
+// параметров: id, phone или telegramId.
+//
+// Количество платежей в истории зависит от роли запрашивающего:
+//   - owner: вся история платежей
+//   - manager / admin: только 2 последних платежа
+// ---------------------------------------------------------
+router.get('/admin/client', requireRole('admin'), async function (req, res) {
+  var id = req.query.id;
+  var phone = req.query.phone ? normalizePhone(req.query.phone) : null;
+  var telegramId = req.query.telegramId;
+
+  if (!id && !phone && !telegramId) {
+    return res.status(400).json({ error: 'Укажите id, phone или telegramId' });
+  }
+
+  try {
+    var whereClause;
+    var param;
+    if (id) { whereClause = 'u.id = $1'; param = id; }
+    else if (telegramId) { whereClause = 'u.telegram_id = $1'; param = telegramId; }
+    else { whereClause = 'u.phone = $1'; param = phone; }
+
+    var userResult = await pool.query(`
+      SELECT u.id, u.full_name, u.phone, u.email, u.telegram_id, u.created_at
+      FROM users u
+      WHERE ${whereClause}
+      LIMIT 1
+    `, [param]);
+
+    if (userResult.rows.length === 0) {
+      return res.json({ found: false });
+    }
+
+    var user = userResult.rows[0];
+
+    var membershipResult = await pool.query(`
+      SELECT status, expires_at, started_at
+      FROM memberships
+      WHERE user_id = $1
+      ORDER BY expires_at DESC NULLS LAST
+      LIMIT 1
+    `, [user.id]);
+
+    var membership = membershipResult.rows.length > 0 ? membershipResult.rows[0] : null;
+
+    var paymentsLimit = req.adminRole === 'owner' ? 10000 : 2;
+
+    var paymentsResult = await pool.query(`
+      SELECT amount, status, prodamus_order_id, paid_at, created_at
+      FROM payments
+      WHERE user_id = $1
+      ORDER BY paid_at DESC NULLS LAST
+      LIMIT $2
+    `, [user.id, paymentsLimit]);
+
+    var totalPaymentsCountResult = await pool.query(
+      'SELECT COUNT(*) FROM payments WHERE user_id = $1',
+      [user.id]
+    );
+
+    res.json({
+      found: true,
+      id: user.id,
+      fullName: user.full_name,
+      phone: user.phone,
+      email: user.email,
+      telegramId: user.telegram_id,
+      createdAt: user.created_at,
+      membership: membership,
+      payments: paymentsResult.rows,
+      totalPaymentsCount: parseInt(totalPaymentsCountResult.rows[0].count, 10),
+      paymentsLimited: req.adminRole !== 'owner',
+    });
+  } catch (err) {
+    console.error('GET /admin/client error:', err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ---------------------------------------------------------
+// АДМИНИСТРАТОР: только просмотр - управляющий + действующие
+// администраторы (без прав назначения/удаления). Владелец не
+// показывается в этом списке.
+// ---------------------------------------------------------
+router.get('/admin/team-overview', requireRole('admin'), async function (req, res) {
+  try {
+    var managerResult = await pool.query(`
+      SELECT a.telegram_id, u.full_name, u.phone
+      FROM admins a
+      LEFT JOIN users u ON u.telegram_id = a.telegram_id
+      WHERE a.role = 'manager'
+      ORDER BY a.created_at ASC
+      LIMIT 1
+    `);
+
+    var adminsResult = await pool.query(`
+      SELECT a.telegram_id, u.full_name, u.phone
+      FROM admins a
+      LEFT JOIN users u ON u.telegram_id = a.telegram_id
+      WHERE a.role = 'admin'
+      ORDER BY a.created_at DESC
+    `);
+
+    res.json({
+      manager: managerResult.rows.length > 0 ? managerResult.rows[0] : null,
+      admins: adminsResult.rows,
+    });
+  } catch (err) {
+    console.error('GET /admin/team-overview error:', err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// ---------------------------------------------------------
+// УПРАВЛЯЮЩИЙ: новые подписчики сегодня и "отписки" сегодня
+// (подписки, заканчивающиеся сегодня - сигнал для прозвона:
+// либо отмена, либо неудачное автосписание)
+// ---------------------------------------------------------
+router.get('/admin/analytics/today-changes', requireRole('manager'), async function (req, res) {
+  try {
+    var newSubscribersResult = await pool.query(`
+      SELECT u.id, u.full_name, u.phone, u.telegram_id
+      FROM users u
+      WHERE u.created_at >= CURRENT_DATE AND u.created_at < CURRENT_DATE + INTERVAL '1 day'
+      ORDER BY u.created_at DESC
+    `);
+
+    var cancelledResult = await pool.query(`
+      SELECT u.id, u.full_name, u.phone, u.telegram_id, m.expires_at
+      FROM memberships m
+      JOIN users u ON u.id = m.user_id
+      WHERE m.expires_at >= CURRENT_DATE AND m.expires_at < CURRENT_DATE + INTERVAL '1 day'
+      ORDER BY m.expires_at DESC
+    `);
+
+    res.json({
+      newSubscribers: newSubscribersResult.rows,
+      cancelledToday: cancelledResult.rows,
+    });
+  } catch (err) {
+    console.error('GET /admin/analytics/today-changes error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
@@ -416,20 +565,27 @@ router.get('/admin/analytics/overview', requireRole('owner'), async function (re
       SELECT COUNT(*) FROM users WHERE created_at >= DATE_TRUNC('month', NOW())
     `);
 
-    // "Выручка за месяц" = расчётный месячный доход по активным подпискам
-    // прямо сейчас (старые активные клиенты + новые в этом месяце,
-    // за вычетом тех, кто перешёл в статус "неактивен"). По сути это
-    // MRR: количество активных подписок × стоимость подписки (390₽).
-    var SUBSCRIPTION_PRICE = 390;
-    var activeCount = parseInt(activeMemberships.rows[0].count, 10);
-    var revenueThisMonth = activeCount * SUBSCRIPTION_PRICE;
+    // Выручка за текущий календарный месяц (реальная сумма платежей
+    // с начала месяца по сейчас)
+    var revenueThisMonthResult = await pool.query(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM payments
+      WHERE status = 'paid' AND paid_at >= DATE_TRUNC('month', NOW())
+    `);
+
+    // Выручка за последние 30 дней (скользящее окно, реальная сумма
+    // платежей) - независимо от выбранного периода в слайдере месяцев
+    var revenueLast30DaysResult = await pool.query(`
+      SELECT COALESCE(SUM(amount), 0) as total FROM payments
+      WHERE status = 'paid' AND paid_at >= NOW() - INTERVAL '30 days'
+    `);
 
     res.json({
       totalUsers: parseInt(totalUsers.rows[0].count, 10),
-      activeMemberships: activeCount,
+      activeMemberships: parseInt(activeMemberships.rows[0].count, 10),
       expiredMemberships: parseInt(expiredMemberships.rows[0].count, 10),
       totalRevenue: parseFloat(totalRevenue.rows[0].total),
-      revenueThisMonth: revenueThisMonth,
+      revenueThisMonth: parseFloat(revenueThisMonthResult.rows[0].total),
+      revenueLast30Days: parseFloat(revenueLast30DaysResult.rows[0].total),
       newUsersThisMonth: parseInt(newUsersThisMonth.rows[0].count, 10),
     });
   } catch (err) {
@@ -506,6 +662,46 @@ router.get('/admin/analytics/upcoming-payments', requireRole('owner'), async fun
     });
   } catch (err) {
     console.error('GET /admin/analytics/upcoming-payments error:', err);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Прогноз ожидаемой выручки по дням на ближайшие N дней (по дате
+// окончания активных подписок - именно в этот день предполагается
+// автосписание следующего платежа). Используется для штрихпунктирной
+// прогнозной линии на графике "Выручка по дням".
+router.get('/admin/analytics/forecast', requireRole('owner'), async function (req, res) {
+  var days = parseInt(req.query.days, 10) || 3;
+  var SUBSCRIPTION_PRICE = 390;
+
+  try {
+    var result = await pool.query(`
+      SELECT TO_CHAR(expires_at, 'YYYY-MM-DD') as date, COUNT(*) as count
+      FROM memberships
+      WHERE status = 'active'
+        AND expires_at > NOW()
+        AND expires_at <= NOW() + INTERVAL '${days} days'
+      GROUP BY TO_CHAR(expires_at, 'YYYY-MM-DD')
+      ORDER BY date ASC
+    `);
+
+    // Заполняем все дни диапазона, даже если в какой-то день нет
+    // ожидаемых платежей (count=0), чтобы график был непрерывным
+    var byDate = {};
+    result.rows.forEach(function (r) { byDate[r.date] = parseInt(r.count, 10); });
+
+    var data = [];
+    for (var i = 1; i <= days; i++) {
+      var d = new Date();
+      d.setDate(d.getDate() + i);
+      var key = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+      var count = byDate[key] || 0;
+      data.push({ date: key, count: count, total: count * SUBSCRIPTION_PRICE });
+    }
+
+    res.json({ data: data });
+  } catch (err) {
+    console.error('GET /admin/analytics/forecast error:', err);
     res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
